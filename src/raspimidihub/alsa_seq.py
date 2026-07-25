@@ -315,6 +315,28 @@ snd_seq_client_info_get_midi_version = _optional_func(
     "snd_seq_client_info_get_midi_version", c_int, SndSeqClientInfoPtr)
 snd_seq_client_info_set_midi_version = _optional_func(
     "snd_seq_client_info_set_midi_version", None, SndSeqClientInfoPtr, c_int)
+# The card a kernel seq client belongs to (-1 for user clients). This is
+# the ONLY authoritative client→card mapping: /proc/asound/seq/clients
+# prints `card=N` on some kernels but only `[Kernel Legacy]` on others
+# (verified on 6.12.75-rpi-v8), and the fallback in device_id.py then has
+# nothing but the client name to go on — which cannot separate two
+# devices of the same model. `aconnect -l` gets its `card=` from here.
+snd_seq_client_info_get_card = _optional_func(
+    "snd_seq_client_info_get_card", c_int, SndSeqClientInfoPtr)
+
+
+def _client_card(cinfo) -> int:
+    """The ALSA card behind a seq client, or -1 when unavailable.
+
+    -1 covers both "user client, no card" and "this alsa-lib is too old
+    to export the accessor" — callers must treat it as "unknown" and fall
+    back, never as "card 0"."""
+    if snd_seq_client_info_get_card is None:
+        return -1
+    try:
+        return int(snd_seq_client_info_get_card(cinfo))
+    except Exception:
+        return -1
 
 
 @dataclass(frozen=True)
@@ -599,6 +621,11 @@ class MidiDevice:
     client_id: int
     name: str
     ports: list[MidiPort] = field(default_factory=list)
+    # ALSA card this kernel client belongs to, straight from the
+    # sequencer (-1 = unknown / user client). Feeds DeviceRegistry.scan
+    # so two same-model devices resolve to their own card — and thus
+    # their own serial — instead of collapsing onto one.
+    card: int = -1
     # UMP endpoint capability (kernel-discovered; empty on non-UMP
     # devices and on systems without UMP support)
     is_ump: bool = False
@@ -799,7 +826,8 @@ class AlsaSeq:
                     ))
 
                 if ports:
-                    dev = MidiDevice(client_id=client_id, name=client_name, ports=ports)
+                    dev = MidiDevice(client_id=client_id, name=client_name,
+                                     ports=ports, card=_client_card(cinfo))
                     self._fill_ump_info(dev)
                     devices.append(dev)
         finally:
@@ -846,7 +874,8 @@ class AlsaSeq:
                     is_ump_endpoint=bool(cap & SND_SEQ_PORT_CAP_UMP_ENDPOINT)))
             if not ports:
                 return None
-            dev = MidiDevice(client_id=client_id, name=client_name, ports=ports)
+            dev = MidiDevice(client_id=client_id, name=client_name, ports=ports,
+                             card=_client_card(cinfo))
             self._fill_ump_info(dev)
             return dev
         finally:

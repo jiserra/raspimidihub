@@ -6,6 +6,20 @@ hashes. Tags: Added, Improved, Fix, Changed, Removed.
 
 Unreleased
 
+- Fix: **two devices of the same model no longer swap identities.** With two
+  identical units plugged in (two M8s, two of any model), both were bound to
+  the *same* ALSA card, so they shared one serial: one device took the saved
+  identity, the other got a "#2" suffix — and which unit got which flipped on
+  every boot, so routing followed the wrong instrument. The hub now asks the
+  sequencer which card each device belongs to instead of guessing from the
+  model name, so each unit keeps its own serial-based identity across reboots
+  and replugs. Existing connections that reference a real serial keep working
+  untouched; a saved "#2" entry has no unit it can safely be matched to and
+  shows as pending until re-pointed once.
+- Fix: the per-port MIDI throughput event (`midi-rates`) was missing from the
+  SSE registry, so it was absent from the live API docs at /docs and warn-logged
+  on every emit.
+
 
 2026-07-13 — Version 6.0.0a2
 

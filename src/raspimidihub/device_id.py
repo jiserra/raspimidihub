@@ -243,9 +243,17 @@ def alsa_client_to_card(client_id: int) -> int | None:
     except OSError:
         pass
 
-    # Strategy 2: match client name to /proc/asound/cards long name
+    # Strategy 2: match client name to /proc/asound/cards long name.
+    # Collect ALL matches and accept only a unique one. Two devices of the
+    # same model produce the same client name ("M8" twice) and BOTH long
+    # names contain it, so returning the first match silently binds both
+    # clients to one card — both then resolve to that card's serial, one
+    # identity overwrites the other, and the loser gets an unstable "#N"
+    # that can swap on the next boot. Ambiguous → None, leaving the device
+    # unidentified rather than misidentified.
     if client_name:
         try:
+            matches = []
             with open("/proc/asound/cards") as f:
                 for line in f:
                     cm = re.match(r'^\s*(\d+)\s+\[', line)
@@ -254,12 +262,23 @@ def alsa_client_to_card(client_id: int) -> int | None:
                         # Next line has the long name
                         next_line = next(f, "").strip()
                         if client_name in next_line:
-                            return card_num
+                            matches.append(card_num)
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                log.warning(
+                    "alsa_client_to_card: client %d (%r) matches %d cards "
+                    "%s by name — cannot disambiguate without "
+                    "snd_seq_client_info_get_card", client_id, client_name,
+                    len(matches), matches)
+                return None
         except OSError:
             pass
 
-    # Strategy 3: scan /proc/asound/cardN/midiN for matching name
+    # Strategy 3: scan /proc/asound/cardN/midiN for matching name.
+    # Same uniqueness rule as strategy 2.
     if client_name:
+        matches = []
         for card_dir in sorted(Path("/proc/asound").glob("card*")):
             try:
                 card_num = int(card_dir.name.replace("card", ""))
@@ -269,9 +288,12 @@ def alsa_client_to_card(client_id: int) -> int | None:
                 try:
                     content = midi_file.read_text()
                     if client_name in content:
-                        return card_num
+                        matches.append(card_num)
+                        break
                 except OSError:
                     pass
+        if len(matches) == 1:
+            return matches[0]
 
     return None
 
@@ -427,6 +449,7 @@ class DeviceRegistry:
     def scan(self, alsa_client_ids: list[int],
              client_names: dict[int, str] | None = None,
              ump_virtual: set[int] | None = None,
+             card_by_client: dict[int, int] | None = None,
              ) -> dict[int, StableDeviceInfo]:
         """Scan and register devices for the given ALSA client IDs.
 
@@ -435,6 +458,13 @@ class DeviceRegistry:
         detected by name and registered with `bt-<MAC>` stable ids.
         Caller passes None for non-BT setups to skip the bluetoothctl
         subprocess entirely.
+
+        `card_by_client` is the authoritative `{client_id: ALSA card}`
+        mapping from the sequencer itself (`snd_seq_client_info_get_card`,
+        -1 = none/unknown). Pass it whenever available: it is the only way
+        to tell two devices of the same model apart, since the `/proc`
+        fallback in `alsa_client_to_card` has nothing but the client name
+        and deliberately refuses to guess between equal names.
 
         `ump_virtual` lists client ids of card-less user clients that
         declared a UMP endpoint (virtual MIDI 2.0 devices — soft
@@ -481,7 +511,11 @@ class DeviceRegistry:
                     self._by_stable_id[stable_id] = info
                     continue
 
-            card_num = alsa_client_to_card(client_id)
+            # Sequencer-reported card wins; -1/absent means "unknown", so
+            # fall back to the /proc heuristics.
+            card_num = (card_by_client or {}).get(client_id, -1)
+            if card_num is None or card_num < 0:
+                card_num = alsa_client_to_card(client_id)
             if card_num is None:
                 # Virtual MIDI 2.0 device (UMP-declared user client):
                 # no sysfs identity — key on the endpoint/client name.

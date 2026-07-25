@@ -352,8 +352,15 @@ class MidiEngine:
         # UMP devices have cards and take the normal sysfs path.
         ump_virtual = {d.client_id for d in self._devices
                        if d.is_ump and d.client_id not in plugin_only_clients}
+        # The sequencer's own client→card mapping. Without it the registry
+        # falls back to matching client names against /proc/asound/cards,
+        # which cannot separate two devices of the same model (two M8s are
+        # both just "M8") — they collapsed onto one card, shared a serial,
+        # and the loser got a "#N" that reshuffled on every boot.
+        card_by_client = {d.client_id: d.card for d in self._devices}
         self._device_registry.scan(hw_client_ids, client_names=client_names,
-                                   ump_virtual=ump_virtual)
+                                   ump_virtual=ump_virtual,
+                                   card_by_client=card_by_client)
         # Register plugin devices in the registry
         if self._plugin_host:
             for inst in self._plugin_host.get_instances():

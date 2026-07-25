@@ -1,11 +1,13 @@
 """Tests for device identification and registry."""
 
+import io
 from unittest.mock import patch
 
 from raspimidihub.device_id import (
     DeviceRegistry,
     StableDeviceInfo,
     _identity_serial,
+    alsa_client_to_card,
     vidpid_of_stable_id,
 )
 
@@ -317,3 +319,117 @@ class TestSoftMatch:
         _scan(registry, {20: _usb_info("1-1.5", vid="2467", pid="2033")})
         assert registry.get_by_client(20).stable_id == "usb-1-1.5-2467:2033"
         assert registry.aliases() == {}
+
+
+# --- Same-model devices: card resolution ------------------------------
+#
+# Two devices of the same model report the same ALSA client name ("M8"
+# twice), so the /proc fallback in alsa_client_to_card cannot tell them
+# apart. The sequencer's own client->card mapping can, and scan() takes
+# it via card_by_client.
+
+
+SEQ_CLIENTS_NO_CARD = '''Client   0 : "System" [Kernel]
+  Port   0 : "Timer" (RWe-) [In/Out]
+Client  20 : "M8" [Kernel Legacy]
+  Port   0 : "M8 MIDI 1" (RWeX) [In/Out]
+Client  28 : "M8" [Kernel Legacy]
+  Port   0 : "M8 MIDI 1" (RWeX) [In/Out]
+'''
+
+CARDS_TWO_M8 = ''' 1 [M8             ]: USB-Audio - M8
+                      Dirtywave M8 at usb-0000:01:00.0-1.1, high speed
+ 2 [MK3            ]: USB-Audio - Launchpad Pro MK3
+                      Novation Launchpad Pro MK3 at usb-0000:01:00.0-1.4, full speed
+ 3 [M8_1           ]: USB-Audio - M8
+                      Dirtywave M8 at usb-0000:01:00.0-1.2.1, high speed
+'''
+
+
+def _fake_proc_open(files):
+    """Replacement for builtins.open serving canned /proc/asound files."""
+    def _open(path, *args, **kwargs):
+        key = str(path)
+        if key in files:
+            return io.StringIO(files[key])
+        raise FileNotFoundError(key)
+    return _open
+
+
+class TestAlsaClientToCard:
+    def test_ambiguous_name_refuses_to_guess(self):
+        """Two cards whose long names both contain the client name must
+        NOT resolve — picking the first bound both M8s to one card, so
+        they shared a serial and one got an unstable '#N'."""
+        files = {"/proc/asound/seq/clients": SEQ_CLIENTS_NO_CARD,
+                 "/proc/asound/cards": CARDS_TWO_M8}
+        with patch("builtins.open", side_effect=_fake_proc_open(files)), \
+             patch("raspimidihub.device_id.Path") as mock_path:
+            # strategy 3 must not be reached; glob would find nothing anyway
+            mock_path.return_value.glob.return_value = []
+            assert alsa_client_to_card(20) is None
+            assert alsa_client_to_card(28) is None
+
+    def test_unique_name_still_resolves(self):
+        files = {"/proc/asound/seq/clients":
+                 'Client  24 : "Launchpad Pro MK3" [Kernel Legacy]\n'
+                 '  Port   0 : "LPProMK3 MIDI" (RWeX) [In/Out]\n',
+                 "/proc/asound/cards": CARDS_TWO_M8}
+        with patch("builtins.open", side_effect=_fake_proc_open(files)):
+            assert alsa_client_to_card(24) == 2
+
+
+class TestCardByClient:
+    def test_same_model_devices_keep_own_identity(self):
+        """Two M8s on different cards resolve to their own serials — no
+        collision, so neither gets a '#N' suffix."""
+        registry = DeviceRegistry()
+        devices = {
+            1: _usb_info("1-1.1", vid="16c0", pid="048a", serial="11548430",
+                         name="M8"),
+            3: _usb_info("1-1.2.1", vid="16c0", pid="048a", serial="11227100",
+                         name="M8"),
+        }
+        with patch("raspimidihub.device_id.alsa_client_to_card") as mock_card, \
+             patch("raspimidihub.device_id.get_card_stable_id") as mock_info:
+            mock_info.side_effect = lambda card: devices[card]
+            result = registry.scan([20, 28], card_by_client={20: 1, 28: 3})
+            # the authoritative mapping is enough — no /proc guessing
+            mock_card.assert_not_called()
+
+        assert result[20].stable_id == "usb-16c0:048a-11548430"
+        assert result[28].stable_id == "usb-16c0:048a-11227100"
+        assert not any("#" in i.stable_id for i in result.values())
+
+    def test_unknown_card_falls_back_to_proc(self):
+        """-1 means 'sequencer could not say' (user client, or an alsa-lib
+        without the accessor) — the /proc path must still run."""
+        registry = DeviceRegistry()
+        devices = {7: _usb_info("1-1.3", vid="16c0", pid="048a",
+                                serial="11548430", name="M8")}
+        with patch("raspimidihub.device_id.alsa_client_to_card") as mock_card, \
+             patch("raspimidihub.device_id.get_card_stable_id") as mock_info:
+            mock_card.return_value = 7
+            mock_info.side_effect = lambda card: devices[card]
+            result = registry.scan([20], card_by_client={20: -1})
+            mock_card.assert_called_once_with(20)
+
+        assert result[20].stable_id == "usb-16c0:048a-11548430"
+
+    def test_saved_connection_for_one_of_two_survives(self):
+        """A config referencing one M8's serial keeps matching that exact
+        unit once cards are resolved properly."""
+        registry = DeviceRegistry()
+        registry.set_referenced_ids({"usb-16c0:048a-11227100"})
+        devices = {
+            1: _usb_info("1-1.1", vid="16c0", pid="048a", serial="11548430",
+                         name="M8"),
+            3: _usb_info("1-1.2.1", vid="16c0", pid="048a", serial="11227100",
+                         name="M8"),
+        }
+        with patch("raspimidihub.device_id.get_card_stable_id") as mock_info:
+            mock_info.side_effect = lambda card: devices[card]
+            result = registry.scan([20, 28], card_by_client={20: 1, 28: 3})
+
+        assert result[28].stable_id == "usb-16c0:048a-11227100"
+        assert result[20].stable_id == "usb-16c0:048a-11548430"

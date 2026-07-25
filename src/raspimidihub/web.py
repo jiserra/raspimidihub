@@ -58,6 +58,9 @@ SSE_EVENTS = {
                      "and typed 2.0-only messages (RPN/NRPN, Per-Note "
                      "CC/Bend/Mgmt with kind/bank/index); the integer "
                      "fields stay 7-bit for compatibility.",
+    "midi-rates": "Per-port MIDI throughput snapshot, emitted about once a "
+                  "second while any port is passing traffic (drives the "
+                  "activity meters in the matrix / rack views).",
     "cc": "A Control Change value, broadcast for CC monitoring / MIDI-learn.",
     "cc_map_changed": "A plugin CC binding was added, edited, or removed.",
     "cc_learn_result": "A CC Learn armed via the binding popup matched an "
