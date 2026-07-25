@@ -6,6 +6,16 @@ hashes. Tags: Added, Improved, Fix, Changed, Removed.
 
 Unreleased
 
+
+2026-07-25 — Version 6.0.0a3
+
+A fix for anyone running two instruments of the same model. Two M8s
+(or two of anything) were being treated as one device wearing two
+hats: they shared a single identity, and which physical unit answered
+to it changed from boot to boot — so a saved routing could quietly
+end up pointing at the other instrument. Each unit now keeps its own
+identity across reboots and replugs.
+
 - Fix: **two devices of the same model no longer swap identities.** With two
   identical units plugged in (two M8s, two of any model), both were bound to
   the *same* ALSA card, so they shared one serial: one device took the saved
