@@ -38,11 +38,14 @@ def main():
         category = SOURCE_TO_CATEGORY.get(name, 'unknown')
         print(f"-> {name}: due (category: {category}, interval: {interval}s)")
         
-        run_source(name, do_post=True, force=False,
-                   state=state, llm=llm, publishers=publishers,
-                   topic_tracker=topic_tracker)
-        state.touch(name)
-        ran.append(name)
+        rc = run_source(name, do_post=True, force=False,
+                        state=state, llm=llm, publishers=publishers,
+                        topic_tracker=topic_tracker)
+        if rc == 0:
+            state.touch(name)
+            ran.append(name)
+        else:
+            print(f"   {name}: run_source failed (rc={rc}), not updating last_run")
     
     topic_tracker.save()
     state.save()
