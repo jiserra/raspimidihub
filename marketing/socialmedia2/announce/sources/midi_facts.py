@@ -6,6 +6,7 @@ to transform them into engaging posts. No manual facts, no citations.
 import hashlib
 import json
 import random
+import re
 import time
 from pathlib import Path
 from urllib.parse import urlencode

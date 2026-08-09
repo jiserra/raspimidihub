@@ -12,7 +12,7 @@ Added 3 new content sources to increase variety:
 
 | Source | Category | Frequency | Content |
 |--------|----------|-----------|---------|
-| `midi_history` | educational | 24h | Historical MIDI facts (30 curated items) |
+| `midi_history` | educational | 1 week | Historical MIDI facts (30 curated items) |
 | `quick_tips` | educational | 12h | Practical MIDI tips (50 curated items) |
 | `behind_the_code` | entertainment | 48h | Developer stories (25 curated items) |
 

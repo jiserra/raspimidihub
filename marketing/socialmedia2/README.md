@@ -54,7 +54,7 @@ Three abstractions carry the design:
 
 **Scheduling is a stateless tick.** One systemd timer fires `dispatch.py` every
 ~10 min; it runs each source whose interval (config `SCHEDULE`: youtube 1h,
-github 1h, features 4h) has elapsed since its `last_run`. Adding a source later
+github 1h, features 4h, midi_history 1 week) has elapsed since its `last_run`. Adding a source later
 is one module + one schedule entry — no new unit files.
 
 ## Install

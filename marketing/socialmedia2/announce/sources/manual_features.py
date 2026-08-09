@@ -10,6 +10,7 @@ deterministic: the same feature always produces the same post.
 import hashlib
 import json
 import random
+import re
 from pathlib import Path
 
 from .. import config, content

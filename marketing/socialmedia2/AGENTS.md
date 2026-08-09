@@ -626,16 +626,16 @@ ExecStart=<install_dir>/marketing/socialmedia2/.venv/bin/./.venv/bin/python3 -m 
 
 | Source | Schedule | Target | Content |
 |--------|----------|--------|---------|
-| jokes | 9h | Mastodon | MIDI-themed jokes (curated list of 100) |
+| jokes | 12h | Mastodon | MIDI-themed jokes (curated list of 100) |
 | midi_facts | 12h | Mastodon | "Did you know?" facts from Wikipedia/midi.guide |
-| features | 4h | Mastodon | LLM-clustered CHANGELOG topics (prevents repetition) |
+| features | 6h | Mastodon | LLM-clustered CHANGELOG topics (prevents repetition) |
 | evergreen | 4h | Mastodon | Core feature spotlights from manual |
 | youtube | 1h | Mastodon + Discord | New YouTube uploads |
 | github | 1h | Mastodon + Discord | GitHub releases |
-| midi_history | 8h | Mastodon | MIDI history facts |
-| quick_tips | 8h | Mastodon | Practical MIDI tips |
-| creative_uses | 12h | Mastodon | Creative application ideas |
-| behind_the_code | 24h | Mastodon | Development stories |
+| midi_history | 1 week | Mastodon | MIDI history facts |
+| quick_tips | 12h | Mastodon | Practical MIDI tips |
+| creative_uses | 24h | Mastodon | Creative application ideas |
+| behind_the_code | 48h | Mastodon | Development stories |
 
 ## Troubleshooting
 

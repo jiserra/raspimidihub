@@ -113,7 +113,7 @@ SCHEDULE = {
     'jokes': int(_env('SOCIAL_INTERVAL_JOKES', 43200)),        # 12h (reduced frequency)
     'midi_facts': int(_env('SOCIAL_INTERVAL_MIDI_FACTS', 43200)),  # 12h
     'creative_uses': int(_env('SOCIAL_INTERVAL_CREATIVE_USES', 86400)),  # 24h
-    'midi_history': int(_env('SOCIAL_INTERVAL_MIDI_HISTORY', 86400)),  # 24h
+    'midi_history': int(_env('SOCIAL_INTERVAL_MIDI_HISTORY', 604800)),  # 1 week
     'quick_tips': int(_env('SOCIAL_INTERVAL_QUICK_TIPS', 43200)),  # 12h
     'behind_the_code': int(_env('SOCIAL_INTERVAL_BEHIND_CODE', 172800)),  # 48h
     'manual-features': int(_env('SOCIAL_INTERVAL_MANUAL_FEATURES', 43200)),  # 12h - manual features only
