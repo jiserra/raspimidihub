@@ -90,6 +90,14 @@ if tapped.
 One **fade** and one **hard drop** can queue side by side. Two fades
 cannot overlap; the second overrides the first.
 
+When both are queued, **the hard drop wins**. The fade keeps rising
+right up to the drop's bar line -- that is what a riser is for -- and
+then the drop's captured values land and stay; the fade never delivers
+its own target afterwards. This holds whichever button you pressed
+first, and whether the two share a bar line or the fade was set to a
+later one. A drop in **Now** mode stops an in-flight fade immediately,
+since there is no bar line left to build toward.
+
 ## Themes
 
 Eight dark themes ship: Default, Navy, Forest, Wine, Plum, Teal,

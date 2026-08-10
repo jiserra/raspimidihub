@@ -478,11 +478,37 @@ class _ClockedFakeBus(_FakeBus):
 
 
 def _new_with_queue(bus=None):
+    """Controller with an observable stand-in for the ALSA output queue.
+
+    `_scheduled` records parked events; `_cancelled` records the tags
+    pulled back out. Recording the cancels matters: `cancel_scheduled`
+    used to be stubbed as a no-op returning None, which made a MISSING
+    cancel indistinguishable from a present one — that blind spot is why
+    a cancelled riser could still land its target CCs on top of a hard
+    drop while every test stayed green. `_delivered_at` replays the queue
+    so a test can assert what the synth actually hears, in time order."""
     p = _new(bus=bus)
     p._scheduled: list[tuple[float, int, int, int, int]] = []
-    p.send_cc_at = (lambda when, ch, cc, v, tag=0:
-                    p._scheduled.append((when, ch, cc, v, tag)))
-    p.cancel_scheduled = lambda tag: None
+    p._cancelled: list[int] = []
+
+    def _at(when, ch, cc, v, tag=0):
+        p._scheduled.append((when, ch, cc, v, tag))
+
+    def _cancel(tag):
+        p._cancelled.append(tag)
+        p._scheduled[:] = [e for e in p._scheduled if e[4] != tag]
+
+    p.send_cc_at = _at
+    p.cancel_scheduled = _cancel
+
+    def _delivered_at(cc, until=None):
+        """Last value the synth receives on `cc` from the queue, i.e. the
+        event with the greatest `when` at or before `until`."""
+        hits = [e for e in p._scheduled
+                if e[2] == cc and (until is None or e[0] <= until)]
+        return max(hits, key=lambda e: e[0])[3] if hits else None
+
+    p._delivered_at = _delivered_at
     return p
 
 
@@ -565,6 +591,135 @@ class TestPreScheduledSnapshot:
         p.on_tick("1/16")
         # CC was emitted at fire moment via the immediate-send fallback.
         assert (0, 13, 127) in p._sent
+
+
+# --- Drop-wins-over-riser (regression) ---------------------------------------
+#
+# A fade button ("riser") and a hard drop button can be in flight at once.
+# When the drop lands, its values must be the last thing the synth hears and
+# must STAY — the riser must not deliver its own target afterwards.
+#
+# The subtle part: a scheduled drop lives in TWO places, the in-memory slot
+# and the ALSA queue (parked by _schedule_snapshot under a per-button tag).
+# Clearing the slot alone leaves the queued CCs to fire regardless. That was
+# the bug: the riser kept its parked target CCs and overwrote the drop at its
+# own, later boundary — so the synth played the riser's values, not the drop's.
+#
+# The riser deliberately keeps RISING up to the drop's boundary (that is what
+# a riser is for); only its parked "land on target" event is withdrawn.
+
+class TestDropWinsOverRiser:
+    def _armed(self, bus, *, fade_mode, hard_mode):
+        """Riser on button 0 (fade), hard drop on button 1, both on f1."""
+        p = _new_with_queue(bus)
+        p._param_values["drop_modes"] = {"0": fade_mode, "1": hard_mode,
+                                        "2": "bar", "3": "bar"}
+        p._param_values["drop_fade"] = {"0": True, "1": False,
+                                       "2": False, "3": False}
+        p._param_values["drop_sync"] = {"0": False, "1": False,
+                                       "2": False, "3": False}
+        p._param_values["drop_snapshots"]["0"] = {"f1": 80}   # riser target
+        p._param_values["drop_snapshots"]["1"] = {"f1": 30}   # drop target
+        p._param_values["f1"] = 0
+        return p
+
+    def test_riser_queued_target_is_withdrawn_when_drop_scheduled_first(self):
+        # Riser fires at 192 (2 bars), drop at 96 (1 bar). Pressing the
+        # drop must withdraw the riser's parked CCs immediately, so the
+        # riser can never deliver f1=80 after the drop delivered f1=30.
+        bus = _ClockedFakeBus(tick=0)
+        p = self._armed(bus, fade_mode="2bar", hard_mode="bar")
+        p._fire_drop("0")                      # riser
+        assert p._delivered_at(10) == 80       # riser parked its target
+        p._fire_drop("1")                      # drop
+        assert p._drop_tag_for("0") in p._cancelled
+        # Only the drop's value is left in the queue.
+        assert p._delivered_at(10) == 30
+        assert not any(e[3] == 80 for e in p._scheduled)
+        # The rise itself is untouched — it must keep building to the drop.
+        assert "0" in p._drop_fade_start
+        assert p._param_values["drop_states"]["0"] == "scheduled"
+
+    def test_drop_value_survives_past_the_risers_own_boundary(self):
+        # The end-to-end symptom. Advance past the drop's boundary AND
+        # past the riser's, then assert the synth's last word is the
+        # drop's value. Before the fix f1 became 80 at tick 192.
+        bus = _ClockedFakeBus(tick=0)
+        p = self._armed(bus, fade_mode="2bar", hard_mode="bar")
+        p._fire_drop("0")
+        p._fire_drop("1")
+        bus._tick_count = 96
+        p.on_tick("1/16")                      # drop fires, riser evicted
+        assert p._param_values["f1"] == 30
+        bus._tick_count = 192                  # the riser's old boundary
+        p.on_tick("1/16")
+        assert p._param_values["f1"] == 30     # not 80
+        assert p._delivered_at(10) == 30
+        assert p._param_values["drop_schedule"] is None
+
+    def test_equal_boundary_is_decided_by_drop_wins_not_press_order(self):
+        # Both land on the same bar line. Whoever was pressed last used to
+        # win by ALSA-queue insertion order; the rule must be drop-wins.
+        for press_riser_first in (True, False):
+            bus = _ClockedFakeBus(tick=0)
+            p = self._armed(bus, fade_mode="bar", hard_mode="bar")
+            for bid in (("0", "1") if press_riser_first else ("1", "0")):
+                p._fire_drop(bid)
+            why = f"riser_first={press_riser_first}"
+            # Assert on the QUEUE, not the on-screen cell: both slots park
+            # CCs for the same instant, and what the synth hears is decided
+            # there. Only the drop's value may remain parked.
+            assert p._delivered_at(10) == 30, why
+            assert not any(e[3] == 80 for e in p._scheduled), why
+            bus._tick_count = 96
+            p.on_tick("1/16")
+            assert p._param_values["f1"] == 30, why
+
+    def test_riser_firing_before_the_drop_keeps_its_queued_target(self):
+        # Inverse ordering: riser at 96, drop at 192. The riser legitimately
+        # lands first, so its parked CCs must NOT be withdrawn at press.
+        bus = _ClockedFakeBus(tick=0)
+        p = self._armed(bus, fade_mode="bar", hard_mode="2bar")
+        p._fire_drop("0")
+        p._fire_drop("1")
+        assert p._drop_tag_for("0") not in p._cancelled
+        bus._tick_count = 96
+        p.on_tick("1/16")
+        assert p._param_values["f1"] == 80     # riser landed
+        bus._tick_count = 192
+        p.on_tick("1/16")
+        assert p._param_values["f1"] == 30     # then the drop took over
+
+    def test_immediate_drop_stops_an_inflight_riser(self):
+        # A "Now" drop has no boundary left to build toward, so the riser
+        # must stop dead — otherwise _step_fade keeps pushing CCs on top
+        # of the drop on every tick until the riser's own fire tick.
+        bus = _ClockedFakeBus(tick=0)
+        p = self._armed(bus, fade_mode="4bar", hard_mode="immediately")
+        p._fire_drop("0")
+        p._fire_drop("1")
+        assert p._drop_tag_for("0") in p._cancelled
+        assert "0" not in p._drop_fade_start
+        assert p._param_values["drop_schedule"] is None
+        assert p._param_values["f1"] == 30
+        # Further ticks must not resurrect the rise.
+        p._sent.clear()
+        bus._tick_count = 192
+        p.on_tick("1/16")
+        assert p._param_values["f1"] == 30
+        assert p._sent == []
+
+    def test_no_clock_fallback_also_stops_an_inflight_riser(self):
+        # The bus-less fallback fires immediately too, so it needs the
+        # same eviction.
+        bus = _ClockedFakeBus(tick=0)
+        p = self._armed(bus, fade_mode="4bar", hard_mode="bar")
+        p._fire_drop("0")
+        p._clock_bus = None                    # clock stops mid-riser
+        p._fire_drop("1")
+        assert p._drop_tag_for("0") in p._cancelled
+        assert "0" not in p._drop_fade_start
+        assert p._param_values["f1"] == 30
 
 
 # --- Dirty gating: firing a drop is performance, not an edit -----------------

@@ -455,6 +455,41 @@ class ControllerBase(PluginBase):
             self.set_param("drop_schedule",
                            {"fade": slots["fade"], "hard": slots["hard"]})
 
+    def _evict_pending_fire(self, sid: str) -> None:
+        """Give up one button's pending fire completely.
+
+        EVERY path that abandons a slot must call this. A scheduled drop
+        lives in two places: the in-memory slot AND the ALSA queue, where
+        `_schedule_snapshot` parked its snapshot CCs under a per-button
+        tag. Clearing only the slot leaves those CCs to fire anyway —
+        which is exactly how a cancelled riser used to land its target
+        values on top of a hard drop that had already won."""
+        self.cancel_scheduled(self._drop_tag_for(sid))
+        self._drop_fade_start.pop(sid, None)
+        self._drop_fade_last_emit.pop(sid, None)
+
+    def _kill_inflight_fade(self, states: dict) -> None:
+        """Abandon any in-flight fade because a hard drop is landing NOW.
+
+        Used by the immediate-fire paths only. The *scheduled* case is
+        deliberately different: there the rise keeps building to its
+        boundary (see `_fire_drop`) because that is what a riser is for.
+        An immediate fire has no boundary left to build toward, so the
+        fade stops here or it would keep stepping CCs on top of the drop
+        until its own fire tick.
+
+        Mutates `states` in place; the caller writes it."""
+        slots = self._schedule_slots()
+        fade_slot = slots["fade"]
+        if not fade_slot:
+            return
+        fade_sid = str(fade_slot["button_id"])
+        self._evict_pending_fire(fade_sid)
+        snaps = self._param_values.get("drop_snapshots") or {}
+        states[fade_sid] = "captured" if snaps.get(fade_sid) else "idle"
+        slots["fade"] = None
+        self._write_schedule(slots)
+
     def _fire_drop(self, sid: str) -> None:
         """Press semantics:
         - if THIS button is currently scheduled (in either slot), cancel.
@@ -477,6 +512,7 @@ class ControllerBase(PluginBase):
         modes = self._param_values.get("drop_modes") or {}
         mode = modes.get(sid, "immediately")
         if mode == "immediately":
+            self._kill_inflight_fade(states)
             self._apply_snapshot(snap)
             # Brief 'firing' flash then back to captured.
             states[sid] = "firing"
@@ -489,6 +525,7 @@ class ControllerBase(PluginBase):
         if bus is None:
             # No clock running — fall back to immediate fire so the
             # drop still works even without a master clock.
+            self._kill_inflight_fade(states)
             self._apply_snapshot(snap)
             states[sid] = "captured"
             self.set_param("drop_states", states)
@@ -498,6 +535,8 @@ class ControllerBase(PluginBase):
             now_tick = bus._tick_count  # lock-free read; arithmetic only
             tpb = bus._ticks_per_bar
         except AttributeError:
+            self._kill_inflight_fade(states)
+            self.set_param("drop_states", states)
             self._apply_snapshot(snap)
             return
 
@@ -534,11 +573,48 @@ class ControllerBase(PluginBase):
             other_sid = str(bumped["button_id"])
             states[other_sid] = "captured" if (
                 self._param_values.get("drop_snapshots") or {}).get(other_sid) else "idle"
-            self._drop_fade_start.pop(other_sid, None)
-            self._drop_fade_last_emit.pop(other_sid, None)
             # The bumped button's pre-scheduled CCs (if any) must be
             # cancelled so they don't fire alongside the new schedule.
-            self.cancel_scheduled(self._drop_tag_for(other_sid))
+            self._evict_pending_fire(other_sid)
+
+        # Drop-wins over a pending riser. A hard drop landing at or before
+        # an in-flight fade's boundary must be the LAST thing the synth
+        # hears. The fade keeps RISING — musically it should build right up
+        # to the drop — but it must not deliver its own target afterwards.
+        # Since both slots park their snapshot in the ALSA queue, "who wins"
+        # is decided there, not by the in-memory slots; at an equal boundary
+        # it would otherwise come down to queue insertion order, i.e. to
+        # which button happened to be pressed last. So exactly one of the
+        # two may hold parked CCs, and the rule has to hold in BOTH press
+        # orders — hence two symmetric halves.
+        suppress_pre_schedule = False
+        if slot_key == "hard":
+            # Drop pressed while a riser is in flight: withdraw the riser's
+            # parked target. `pre_scheduled=False` keeps _tick_slot honest —
+            # if this hard slot is later cancelled and the fade does reach
+            # its boundary, it re-sends the CCs instead of assuming the
+            # queue already carried them.
+            fade_slot = slots["fade"]
+            if (fade_slot and str(fade_slot["button_id"]) != sid
+                    and fade_slot.get("fire_at_tick", 0) >= fire_at_tick):
+                self.cancel_scheduled(
+                    self._drop_tag_for(str(fade_slot["button_id"])))
+                fade_slot = dict(fade_slot)
+                fade_slot["pre_scheduled"] = False
+                slots["fade"] = fade_slot
+        else:
+            # Riser armed while a drop is ALREADY scheduled at or before
+            # the riser's boundary. The drop fires first (or together)
+            # and evicts this fade, so parking a target now would only
+            # give the riser a chance to overwrite the drop at the same
+            # instant — decided by queue insertion order, i.e. by press
+            # order. Let it rise, but never park a target.
+            hard_slot = slots["hard"]
+            if (hard_slot and str(hard_slot["button_id"]) != sid
+                    and hard_slot.get("fire_at_tick") is not None
+                    and hard_slot["fire_at_tick"] <= fire_at_tick):
+                suppress_pre_schedule = True
+
         states[sid] = "scheduled"
         self.set_param("drop_states", states)
 
@@ -554,7 +630,7 @@ class ControllerBase(PluginBase):
         # back to immediate _apply_snapshot at fire moment.
         pre_scheduled = False
         tick_to_monotonic = getattr(bus, "tick_to_monotonic", None)
-        if callable(tick_to_monotonic):
+        if not suppress_pre_schedule and callable(tick_to_monotonic):
             fire_at_monotonic = tick_to_monotonic(fire_at_tick)
             if fire_at_monotonic is not None:
                 self._schedule_snapshot(
@@ -603,13 +679,11 @@ class ControllerBase(PluginBase):
         self._write_schedule(slots)
         # Pull any pre-scheduled CCs for this button out of the ALSA queue
         # so they don't fire after the user cancelled.
-        self.cancel_scheduled(self._drop_tag_for(sid))
+        self._evict_pending_fire(sid)
         states = dict(self._param_values.get("drop_states") or {})
         snaps = self._param_values.get("drop_snapshots") or {}
         states[sid] = "captured" if snaps.get(sid) else "idle"
         self.set_param("drop_states", states)
-        self._drop_fade_start.pop(sid, None)
-        self._drop_fade_last_emit.pop(sid, None)
 
     def _apply_snapshot(self, snap: dict) -> None:
         """Re-emit each captured CC + snap on-screen cells to the
@@ -729,8 +803,12 @@ class ControllerBase(PluginBase):
         new_fade = slots["fade"]
         if hard_fired and new_fade is not None:
             fade_sid = str(new_fade["button_id"])
-            self._drop_fade_start.pop(fade_sid, None)
-            self._drop_fade_last_emit.pop(fade_sid, None)
+            # Must go through _evict_pending_fire: the fade's snapshot CCs
+            # may still be parked in the ALSA queue for its own (later)
+            # boundary, and would land on top of the drop we just fired.
+            # `_fire_drop` already pulls them at press time for the common
+            # case; this covers a fade scheduled AFTER the hard slot.
+            self._evict_pending_fire(fade_sid)
             st = dict(self._param_values.get("drop_states") or {})
             snaps = self._param_values.get("drop_snapshots") or {}
             st[fade_sid] = "captured" if snaps.get(fade_sid) else "idle"

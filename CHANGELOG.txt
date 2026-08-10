@@ -6,6 +6,17 @@ hashes. Tags: Added, Improved, Fix, Changed, Removed.
 
 Unreleased
 
+- Fix: **a hard drop now really wins over a running riser.** With a fade
+  button building and a hard drop button queued on the same bars, the riser
+  still delivered its own target values *after* the drop landed, so the synth
+  played the rise's end state instead of the dropped one. A scheduled drop
+  lives both in the schedule and pre-queued in the ALSA output queue, and the
+  path that cancelled the riser only cleared the former — its queued CCs fired
+  anyway. The riser now keeps rising right up to the drop's bar line and then
+  gets out of the way completely, in either press order, whether the two share
+  a bar line or the riser was set to a later one. A drop in "Now" mode stops an
+  in-flight riser immediately.
+
 
 2026-07-25 — Version 6.0.0a3
 
