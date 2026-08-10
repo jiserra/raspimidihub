@@ -99,8 +99,6 @@ class WikipediaExtractor:
 
     def _extract_facts(self, html: str, page_title: str) -> list:
         """Parse HTML and extract fact candidates."""
-        import re
-
         facts = []
 
         # Extract section headings and their content
@@ -169,8 +167,6 @@ class MidiGuideExtractor:
 
     def _extract_facts(self, html: str) -> list:
         """Parse HTML and extract fact candidates."""
-        import re
-
         facts = []
 
         # Extract section content
