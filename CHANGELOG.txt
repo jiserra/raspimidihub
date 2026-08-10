@@ -6,6 +6,17 @@ hashes. Tags: Added, Improved, Fix, Changed, Removed.
 
 Unreleased
 
+
+2026-08-10 — Version 6.0.0a4
+
+One fix, for anyone who performs with the Controller's drop buttons. A
+fade button ("riser") building into a hard drop on the same bars did not
+hand over cleanly: the drop landed on its bar line, and then the riser
+delivered its own target values on top of it a bar or two later — so the
+synth ended up where the rise had been heading, not where the drop put
+it. The riser now builds right up to the drop and then gets out of the
+way completely.
+
 - Fix: **a hard drop now really wins over a running riser.** With a fade
   button building and a hard drop button queued on the same bars, the riser
   still delivered its own target values *after* the drop landed, so the synth
