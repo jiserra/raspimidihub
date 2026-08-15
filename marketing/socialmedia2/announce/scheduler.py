@@ -159,6 +159,8 @@ def select_source_from_category(state: State, category: str, topic_tracker: Topi
     for source in sources:
         if source not in config.SCHEDULE:
             continue
+        if source in config.DISABLED_SOURCES:
+            continue
         
         # Skip if source is not due by its own interval
         if not state.due(source, config.SCHEDULE[source]):

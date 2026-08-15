@@ -29,6 +29,9 @@ def main():
     for name in scheduled:
         if name not in SOURCES:
             continue
+        if name in config.DISABLED_SOURCES:
+            print(f"   {name}: skipped (disabled)")
+            continue
         
         interval = config.SCHEDULE.get(name, 3600)
         if not state.due(name, interval):

@@ -120,3 +120,10 @@ SCHEDULE = {
 }
 
 SITE_URL = _env('SOCIAL_SITE_URL', 'https://raspimidihub.com')
+
+# --- Sources to disable (comma-separated names, e.g. 'midi_facts,midi_history')
+DISABLED_SOURCES = {
+    s.strip()
+    for s in _env('SOCIAL_DISABLED_SOURCES', 'midi_facts').split(',')
+    if s.strip()
+}
