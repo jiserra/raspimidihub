@@ -750,6 +750,30 @@ class AudioEngine:
 
         return ""
 
+    def _get_usb_serial(self, card_num: int) -> str:
+        """Get USB serial number for stable device identification."""
+        try:
+            # Check sysfs for USB device information
+            card_path = Path(f"/sys/class/sound/card{card_num}")
+            if card_path.exists():
+                # Look for device symlink to get USB serial
+                device_link = card_path / "device"
+                if device_link.is_symlink():
+                    # Try to read serial from uevent file
+                    uevent_path = device_link / "uevent"
+                    if uevent_path.exists():
+                        uevent_content = uevent_path.read_text()
+                        for line in uevent_content.splitlines():
+                            if line.startswith("PRODUCT=") or line.startswith("SERIAL="):
+                                # Extract unique identifier
+                                parts = line.split("=")[1].split("/")
+                                if len(parts) >= 2:
+                                    return f"{parts[-2]}/{parts[-1]}" if "/" in line else parts[-1]
+        except Exception as e:
+            log.debug("Failed to get USB serial: %s", e)
+
+        return ""
+
     def _get_device_sample_rates(self, card_num: int) -> List[int]:
         """Get supported sample rates for audio device."""
         # Common sample rates for USB audio
@@ -1127,3 +1151,9 @@ class AudioEngine:
     def monitor_port(self):
         """Compatibility property for MidiEngine interface."""
         return self._monitor_port
+
+    def snapshot_rates(self) -> Dict:
+        """Return event rates for monitoring (MidiEngine compatibility)."""
+        # Audio engine doesn't have the same event rate structure as MIDI
+        # Return empty dict for compatibility
+        return {}
