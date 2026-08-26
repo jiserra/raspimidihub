@@ -86,6 +86,12 @@ class AudioEngine:
         # JACK client name
         self._client_name = "RaspiMIDIHub"
 
+        # Change sequence for autosaver (parallel to MidiEngine._change_seq)
+        self._change_seq = 0
+
+        # Config dirty tracking (parallel to MidiEngine.config_dirty)
+        self.config_dirty = False
+
         # Audio routing settings
         self._sample_rate = 48000
         self._buffer_size = 128
@@ -698,12 +704,27 @@ class AudioEngine:
         # Fallback: use card number and name (may change across reconnects)
         return f"audio-card{card_num}-{device_name.lower()}"
 
-    def _generate_stable_device_id(self, card_num: int, device_name: str) -> str:
-        """Generate stable device ID from card number and name."""
+    def _generate_stable_device_id(self, card_num: int, device_name: str, alsa_device: dict = None) -> str:
+        """Generate stable device ID from card number and name.
+
+        Args:
+            card_num: ALSA card number
+            device_name: Device name from ALSA
+            alsa_device: Full ALSA device dict (optional, for additional info)
+
+        Returns:
+            Stable device ID string
+        """
         # Try to get USB serial number for truly stable ID
         serial = self._get_usb_serial(card_num)
         if serial:
             return f"audio-{device_name}-{serial}"
+
+        # Try to use USB topology if available
+        if alsa_device:
+            usb_port = alsa_device.get("usb_port", "")
+            if usb_port:
+                return f"audio-{device_name.lower()}-usb{usb_port}"
 
         # Fallback: use card number and name (may change across reconnects)
         return f"audio-card{card_num}-{device_name.lower()}"
