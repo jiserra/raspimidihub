@@ -8,6 +8,7 @@ Connection Kit.
 import asyncio
 import logging
 import re
+import tempfile
 import time
 from typing import Optional, Dict, List, Callable
 from dataclasses import dataclass
@@ -132,7 +133,9 @@ class AudioEngine:
         # what we own — and the hotplug watchdog can respawn on death.
         self._jack_proc: Optional["object"] = None      # our jackd Popen (None if pre-existing)
         self._bridge_procs: Dict[str, object] = {}       # jack client name -> Popen
-        self._jack_clients_by_card: Dict[int, str] = {}  # card_num -> jack client name
+        self._jack_errfile = None                        # jackd stderr (read on death for diagnosis)
+        self._bridge_errfiles: Dict[str, object] = {}    # bridge client name -> stderr file
+        self._next_graph_retry = 0.0                     # monotonic time of next bring-up retry        self._jack_clients_by_card: Dict[int, str] = {}  # card_num -> jack client name
         self._card_of_device: Dict[str, int] = {}        # device_id -> ALSA card num
         self._jack_was_external = False                  # True if jackd was already running at start
 
@@ -254,13 +257,27 @@ class AudioEngine:
                     return
                 self._start_jack_server(owner_card)
 
-            # Bridge every other USB card into the graph. When jackd was
-            # pre-existing we don't know which card it bound; conservatively
-            # bridge nothing then — single-owner-card routing still works.
-            if not jack_running:
-                self._bridge_secondary_cards(alsa_devices, owner_card)
-                if owner_card is not None:
-                    self._jack_clients_by_card[owner_card] = "system"
+            # Bridge every other USB card into the graph — but only when a
+            # server is actually answering. Spawning bridges with no JACK
+            # daemon used to produce alsa_in processes that die within
+            # seconds and retrigger endless watchdog rebuilds.
+            if self._server_reachable():
+                if not jack_running:
+                    self._bridge_secondary_cards(alsa_devices, owner_card)
+                    if owner_card is not None:
+                        self._jack_clients_by_card[owner_card] = "system"
+            else:
+                if self._jack_proc is not None and self._jack_proc.poll() is None:
+                    log.warning("jackd running but not answering yet — "
+                                "bridging deferred; watchdog will reconcile")
+                else:
+                    log.error("No usable JACK server (jackd failed to bind or "
+                              "died) — devices still listed, connects will "
+                              "fail until bring-up succeeds (retrying every "
+                              "30 s).")
+                # Devices are discovered independently of the graph, so the
+                # UI keeps showing them; the hot-plug monitor retries this
+                # bring-up periodically.
 
         except Exception as e:
             log.error("Failed to initialize JACK graph: %s", e)
@@ -298,10 +315,36 @@ class AudioEngine:
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name.strip())
         return safe[:24] or f"audio"
 
-    def _start_jack_server(self, owner_card: int):
+    @staticmethod
+    def _read_err_tail(errfile) -> str:
+        """Last ~400 bytes of a subprocess's captured stderr for logs."""
+        if errfile is None:
+            return ""
+        try:
+            errfile.seek(0, 2)          # end
+            size = errfile.tell()
+            errfile.seek(max(0, size - 400))
+            data = errfile.read()
+            errfile.seek(0, 2)
+            text = data.decode("utf-8", "replace").strip()
+            return f": {text}" if text else ""
+        except Exception:
+            return ""
+
+    def _server_reachable(self, timeout: float = 1.5) -> bool:
+        """True when a JACK server answers `jack_lsp` in OUR runtime dir."""
+        import subprocess
+        try:
+            probe = subprocess.run(["jack_lsp"], capture_output=True, timeout=timeout)
+            return probe.returncode == 0
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            return False
+
+    def _start_jack_server(self, owner_card: int) -> bool:
         """Start jackd bound to `owner_card`. Stores our Popen so cleanup
         kills only what we spawned — an externally-started jackd is left
-        alone entirely (_jack_was_external)."""
+        alone entirely (_jack_was_external). Returns True when the server
+        exists afterwards (answered jack_lsp, or at least stays alive)."""
         import subprocess
 
         target_device = f"hw:{owner_card}"
@@ -321,16 +364,20 @@ class AudioEngine:
         # server which exits once its last client disconnects — a bridge
         # restart must never be able to kill the daemon.
         log.info("Starting jackd: %s", " ".join(cmd))
+        errf = tempfile.TemporaryFile()
+        self._jack_errfile = errf
         try:
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=errf,
                 start_new_session=True,
             )
         except FileNotFoundError:
             log.warning("jackd binary not found — audio routing unavailable")
-            return
+            errf.close()
+            self._jack_errfile = None
+            return False
 
         # jackd takes a moment to open the device before clients can attach.
         for _ in range(20):                      # up to ~4 s
@@ -342,19 +389,27 @@ class AudioEngine:
                 if probe.returncode == 0:
                     self._jack_proc = process
                     log.info("jackd started (PID %d) on %s", process.pid, target_device)
-                    return
+                    return True
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 continue
 
         if process.poll() is not None:
+            # Typical cause of rc=255: another process already holds the ALSA
+            # device (EBUSY). The captured stderr tail says it in jackd's own
+            # words — surface it instead of swallowing it.
             log.error("jackd exited immediately (rc=%s) on %s "
-                      "(check: another process may own hw:%s)",
-                      process.returncode, target_device, owner_card)
-        else:
-            # Still alive but never answered jack_lsp — leave it running,
-            # it may just be slow; watchdog will reconcile later.
-            self._jack_proc = process
-            log.warning("jackd alive but did not answer jack_lsp within 4 s")
+                      "(another process may own hw:%s)%s",
+                      process.returncode, target_device, owner_card,
+                      self._read_err_tail(errf))
+            errf.close()
+            self._jack_errfile = None
+            return False
+
+        # Still alive but never answered jack_lsp — leave it running,
+        # it may just be slow; watchdog will reconcile later.
+        self._jack_proc = process
+        log.warning("jackd alive but did not answer jack_lsp within 4 s")
+        return True
 
     def _apply_jack_client_names(self):
         """Stamp the resolved JACK client names onto the live AudioDevice
@@ -400,22 +455,47 @@ class AudioEngine:
                 continue
 
             import subprocess
+            errf = tempfile.TemporaryFile()
             try:
                 proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL,
+                                        stderr=errf,
                                         start_new_session=True)
             except OSError as e:
                 log.warning("Failed to spawn %s for card %d: %s", tool, card, e)
+                errf.close()
                 continue
 
-            time.sleep(0.5)  # let the bridge register with jackd
-            if proc.poll() is not None:
-                log.warning("%s for card %d died immediately (rc=%s) "
-                            "(missing jack-example-tools? bad rate?)",
-                            tool, card, proc.returncode)
+            # A spawned process is not a working bridge. `alsa_in` starts
+            # fine with no JACK server anywhere and dies a few seconds later;
+            # only treat this as success once its client actually registers
+            # with the server (or it provably keeps running).
+            registered = False
+            for _ in range(6):                    # up to ~3 s
+                time.sleep(0.5)
+                if proc.poll() is not None:
+                    break
+                try:
+                    lsp = subprocess.run(["jack_lsp"], capture_output=True, timeout=1)
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    continue
+                if lsp.returncode == 0 and any(
+                        line.split(":", 1)[0] == base
+                        for line in (lsp.stdout or b"").decode("utf-8", "replace").splitlines()):
+                    registered = True
+                    break
+
+            if not registered:
+                rc_note = (f"exited rc={proc.returncode}"
+                           if proc.poll() is not None else "never registered")
+                log.warning("%s for card %d failed (%s)%s",
+                            tool, card, rc_note, self._read_err_tail(errf))
+                if proc.poll() is None:           # alive but useless — stop it
+                    proc.terminate()
+                errf.close()
                 continue
 
             self._bridge_procs[base] = proc
+            self._bridge_errfiles[base] = errf
             self._jack_clients_by_card[card] = base
             log.info("Bridged card %d (%s) via %s as client '%s'",
                      card, dev.get("name"), role, base)
@@ -423,21 +503,6 @@ class AudioEngine:
         if missing:
             log.warning("%s not found — install jack-example-tools to route "
                         "through cards other than the jackd host", missing[0])
-
-    def _assign_jack_clients(self, devices: List[dict],
-                             owner_card: Optional[int]):
-        """Map each discovered AudioDevice to the JACK client name that
-        carries it. Owner card == 'system'; bridged cards carry the name
-        passed to alsa_in/alsa_out."""
-        if owner_card is not None:
-            self._jack_clients_by_card[owner_card] = "system"
-        for dev in devices:
-            card = dev["card"]
-            if card in self._jack_clients_by_card:
-                continue
-        # device_id -> card bookkeeping + final name assignment happens over
-        # the created AudioDevice objects (see _discover_audio_devices).
-
 
     def _discover_audio_devices(self):
         """Discover audio devices via ALSA and JACK.
@@ -1173,6 +1238,23 @@ class AudioEngine:
                     await self._rebuild_audio_graph()
                     continue
 
+                # Graph bring-up never succeeded (jackd could not bind, e.g.
+                # its ALSA device was busy) — retry periodically instead of
+                # dying forever. This also covers "the blocking process went
+                # away" recovery without needing a replug or mode switch.
+                if (self._jack_proc is None and not self._bridge_procs
+                        and not self._jack_was_external
+                        and time.monotonic() >= self._next_graph_retry):
+                    self._next_graph_retry = time.monotonic() + 30.0
+                    log.info("JACK graph absent — retrying audio graph "
+                             "bring-up")
+                    try:
+                        self._initialize_jack()
+                        self._discover_audio_devices()
+                        self._restore_saved_connections()
+                    except Exception:
+                        log.exception("Audio graph retry failed")
+
                 # Check if devices have changed
                 current_state = self._get_current_device_state()
 
@@ -1205,7 +1287,28 @@ class AudioEngine:
         because its USB card was yanked). Runs blocking work inline — this
         is a rare recovery path, not a steady-state cost."""
         log.warning("Rebuilding audio graph")
+        for name, proc in self._bridge_procs.items():
+            state = (f"exited rc={proc.returncode}"
+                     if proc.poll() is not None else "still running")
+            log.warning("Discarding bridge '%s' (%s)%s", name, state,
+                        self._read_err_tail(self._bridge_errfiles.get(name)))
+        for errf in self._bridge_errfiles.values():
+            try:
+                errf.close()
+            except Exception:
+                pass
+        self._bridge_errfiles.clear()
         self._bridge_procs.clear()
+        if self._jack_errfile is not None and self._jack_proc is not None \
+                and self._jack_proc.poll() is not None:
+            log.warning("Old jackd rc=%s%s", self._jack_proc.returncode,
+                        self._read_err_tail(self._jack_errfile))
+        if self._jack_errfile is not None:
+            try:
+                self._jack_errfile.close()
+            except Exception:
+                pass
+            self._jack_errfile = None
         self._jack_proc = None
         try:
             await asyncio.sleep(1.0)   # let the kernel settle the USB removal
