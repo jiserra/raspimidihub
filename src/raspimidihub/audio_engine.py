@@ -143,6 +143,7 @@ class AudioEngine:
         self._jack_clients_by_card: Dict[int, List[str]] = {}  # card_num -> its JACK client names
         self._card_of_device: Dict[str, int] = {}        # device_id -> ALSA card num
         self._jack_was_external = False                  # True if jackd was already running at start
+        self._owner_card: Optional[int] = None           # card our own jackd binds (None otherwise)
 
     @property
     def devices(self) -> List[AudioDevice]:
@@ -241,6 +242,10 @@ class AudioEngine:
         under a stable client name. Without the bridges only ONE of the two
         USB gadgets would exist inside JACK and cross-device routing could
         never physically connect.
+
+        Safe to call repeatedly: a server we didn't start is left alone,
+        and re-running against a live graph only fills gaps (no daemon
+        restart, no duplicate bridges).
         """
         import subprocess
 
@@ -251,26 +256,40 @@ class AudioEngine:
                 jack_running = result.returncode == 0
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 jack_running = False
-            self._jack_was_external = jack_running
+
+            if jack_running and self._owner_card is None:
+                # A server answers that WE did not start. Keep hands off
+                # entirely — fighting someone else's rig is worse than no
+                # routing. Mark it external so the retry loop stays quiet.
+                self._jack_was_external = True
+                log.info("Pre-existing JACK server detected — hub does not "
+                         "manage this audio graph")
+                return
 
             alsa_devices = self._scan_alsa_devices()
 
+            owner_card = self._owner_card
             if not jack_running:
+                self._jack_was_external = False
                 owner_card = self._pick_owner_card(alsa_devices)
                 if owner_card is None:
                     log.warning("No ALSA cards at all — no audio graph possible")
                     return
-                self._start_jack_server(owner_card)
+                if not self._start_jack_server(owner_card):
+                    # Refused (rc + stderr tail already logged); the 30 s
+                    # retry loop brings bring-up back around.
+                    return
+            elif owner_card is None:
+                owner_card = self._pick_owner_card(alsa_devices)
 
             # Bridge every other USB card into the graph — but only when a
             # server is actually answering. Spawning bridges with no JACK
             # daemon used to produce alsa_in processes that die within
             # seconds and retrigger endless watchdog rebuilds.
             if self._server_reachable():
-                if not jack_running:
-                    self._bridge_secondary_cards(alsa_devices, owner_card)
-                    if owner_card is not None:
-                        self._jack_clients_by_card[owner_card] = ["system"]
+                self._bridge_secondary_cards(alsa_devices, owner_card)
+                if owner_card is not None:
+                    self._jack_clients_by_card[owner_card] = ["system"]
             else:
                 if self._jack_proc is not None and self._jack_proc.poll() is None:
                     log.warning("jackd running but not answering yet — "
@@ -405,6 +424,7 @@ class AudioEngine:
                 probe = subprocess.run(["jack_lsp"], capture_output=True, timeout=1)
                 if probe.returncode == 0:
                     self._jack_proc = process
+                    self._owner_card = owner_card
                     log.info("jackd started (PID %d) on %s", process.pid, target_device)
                     return True
             except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -425,6 +445,7 @@ class AudioEngine:
         # Still alive but never answered jack_lsp — leave it running,
         # it may just be slow; watchdog will reconcile later.
         self._jack_proc = process
+        self._owner_card = owner_card
         log.warning("jackd alive but did not answer jack_lsp within 4 s")
         return True
 
@@ -440,34 +461,57 @@ class AudioEngine:
 
     def _bridge_secondary_cards(self, devices: List[dict], owner_card: int):
         """Spawn alsa_in / alsa_out bridges so every OTHER USB card shows
-        up as its own JACK client. Requires jack-example-tools (Debian);
-        absence is logged once and bridged routing is then impossible."""
+        up as its own JACK client.
+
+        Idempotent: any target client name already visible in the graph
+        is left alone and merely recorded — so this is safe to re-call on
+        hot-plug or after a partial bring-up without ever double-spawning.
+        Requires jack-example-tools (Debian); absence is logged once and
+        bridged routing is then impossible."""
 
         missing = []
+        import shutil
+        import subprocess
+
+        # One snapshot of the live graph's client names for the whole pass.
+        live_clients = set()
+        try:
+            lsp = subprocess.run(["jack_lsp"], capture_output=True, timeout=2)
+            if lsp.returncode == 0:
+                live_clients = {
+                    line.split(":", 1)[0]
+                    for line in lsp.stdout.decode("utf-8", "replace").splitlines()
+                    if ":" in line
+                }
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            pass
+
         for dev in devices:
             card = dev["card"]
             if card == owner_card or not self._is_usb_card(card):
                 continue
             base = self._jack_safe_name(dev.get("name", ""))
-            want_capture = bool(dev.get("has_capture"))
-            want_playback = bool(dev.get("has_playback"))
-
-            import shutil
-            import subprocess
 
             # A card is neither inherently source nor destination — bridge
             # EVERY direction it offers so the routing matrix can pick.
             #   alsa_out : JACK -> card playback  (destination side)
             #   alsa_in  : card capture -> JACK   (source side)
-            bridges = []
-            if want_playback:
+            want = []
+            if dev.get("has_playback"):
                 # Carries the plain client name; destination gadgets are the
                 # common case and unsuffixed reads best in port listings.
-                bridges.append(("alsa_out", "playback", base))
-            if want_capture:
-                bridges.append(("alsa_in", "capture", f"{base}-in"))
-            if not bridges:
+                want.append(("alsa_out", "playback", base))
+            if dev.get("has_capture"):
+                want.append(("alsa_in", "capture", f"{base}-in"))
+            if not want:
                 continue
+
+            already = [c for _, _, c in want if c in live_clients]
+            todo = [(t, r, c) for t, r, c in want if c not in live_clients]
+            if already:
+                merged = dict.fromkeys(self._jack_clients_by_card.get(card, [])
+                                       + already)
+                self._jack_clients_by_card[card] = list(merged)
 
             def spawn_bridge(tool: str, role: str, cname: str) -> bool:
                 args = [tool, "-j", cname, "-d", f"hw:{card}",
@@ -524,10 +568,12 @@ class AudioEngine:
                          card, dev.get("name"), role, cname)
                 return True
 
-            created = [cname for tool, role, cname in bridges
+            created = [cname for tool, role, cname in todo
                        if spawn_bridge(tool, role, cname)]
             if created:
-                self._jack_clients_by_card[card] = created
+                merged = dict.fromkeys(self._jack_clients_by_card.get(card, [])
+                                       + created)
+                self._jack_clients_by_card[card] = list(merged)
 
         if missing:
             log.warning("%s not found — install jack-example-tools to route "
@@ -1228,6 +1274,7 @@ class AudioEngine:
                 log.warning("Failed to stop our jackd: %s", e)
             finally:
                 self._jack_proc = None
+                self._owner_card = None
         else:
             log.info("jackd was not ours — left running")
 
@@ -1340,6 +1387,7 @@ class AudioEngine:
                 pass
             self._jack_errfile = None
         self._jack_proc = None
+        self._owner_card = None
         try:
             await asyncio.sleep(1.0)   # let the kernel settle the USB removal
             self._initialize_jack()
@@ -1350,84 +1398,80 @@ class AudioEngine:
             log.exception("Audio graph rebuild failed")
 
     def _get_current_device_state(self) -> Dict[str, bool]:
-        """Get current state of audio devices."""
+        """Set of stable device ids present RIGHT NOW.
+
+        Keyed by the SAME device_id generation the discovery uses, so the
+        hotplug diff survives card-number churn (an unplug/replug cycle
+        typically moves the gadget to a different ALSA card number).
+        The previous card-number-string parse leaked garbage keys from
+        the description lines and never matched, stacking up duplicate
+        entries in _devices on every replug.
+        """
         state = {}
         try:
-            cards_path = Path("/proc/asound/cards")
-            if cards_path.exists():
-                for line in cards_path.read_text().splitlines():
-                    if line.strip():
-                        # Extract card number
-                        parts = line.split(":")
-                        if parts:
-                            card_num = parts[0].strip()
-                            state[card_num] = True
+            for d in self._scan_alsa_devices():
+                dev = self._create_audio_device_from_alsa(d)
+                if dev:
+                    state[dev.device_id] = True
         except Exception as e:
             log.warning("Failed to get device state: %s", e)
-
         return state
 
     async def _handle_device_addition(self, new_devices: set):
-        """Handle addition of new audio devices."""
+        """Integrate newly-seen devices.
+
+        Brings graph coverage up to date (a fresh card needs its
+        alsa_in/alsa_out bridges spawned), re-runs discovery, then re-wires
+        whatever saved connections now have both ends online. Safe when the
+        graph was never up — every step no-ops or retries honestly then.
+        """
         try:
-            # Re-scan devices to pick up new hardware
-            old_device_count = len(self._devices)
+            if self._server_reachable() and self._owner_card is not None:
+                self._bridge_secondary_cards(self._scan_alsa_devices(),
+                                             self._owner_card)
+
+            # Re-registers everything under stable ids (replaces rather
+            # than duplicates) and fires the connected callbacks itself.
             self._discover_audio_devices()
-            new_device_count = len(self._devices)
 
-            if new_device_count > old_device_count:
-                log.info("Added %d new audio device(s)", new_device_count - old_device_count)
-
-                # Notify callbacks
-                for callback in self._on_device_connected_callbacks:
-                    try:
-                        if asyncio.iscoroutinefunction(callback):
-                            await callback(self.devices)
-                        else:
-                            callback(self.devices)
-                    except Exception as e:
-                        log.warning("Device connected callback failed: %s", e)
-
-                # Mark config as dirty for autosave
-                self.mark_dirty()
-
+            self._restore_saved_connections()
+            self.mark_dirty()
         except Exception as e:
             log.error("Failed to handle device addition: %s", e)
 
     async def _handle_device_removal(self, removed_devices: set):
-        """Handle removal of audio devices."""
+        """Forget devices whose stable ids vanished, plus any connections
+        that referenced them."""
+        removed_count = 0
         try:
-            # Remove devices that are no longer present
-            removed_count = 0
-            for device_id, device in list(self._devices.items()):
-                # Check if device is still present
-                device_card_num = device.device_id.split("card")[1].split("-")[0] if "card" in device.device_id else None
-                if device_card_num and device_card_num in removed_devices:
-                    # Remove connections involving this device
-                    self._connections = [
-                        conn for conn in self._connections
-                        if conn.source_device != device_id and conn.dest_device != device_id
-                    ]
+            for device_id in list(self._devices.keys()):
+                if device_id not in removed_devices:
+                    continue
 
-                    # Remove device
-                    del self._devices[device_id]
-                    removed_count += 1
-                    log.info("Removed audio device: %s", device.name)
+                device = self._devices.pop(device_id)
+                self._card_of_device.pop(device_id, None)
 
-                    # Notify callbacks
-                    for callback in self._on_device_disconnected_callbacks:
-                        try:
-                            if asyncio.iscoroutinefunction(callback):
-                                await callback(device_id)
-                            else:
-                                callback(device_id)
-                        except Exception as e:
-                            log.warning("Device disconnected callback failed: %s", e)
+                # Drop connections involving this device
+                self._connections = [
+                    conn for conn in self._connections
+                    if conn.source_device != device_id
+                    and conn.dest_device != device_id
+                ]
+
+                removed_count += 1
+                log.info("Removed audio device: %s", device.name)
+
+                for callback in self._on_device_disconnected_callbacks:
+                    try:
+                        if asyncio.iscoroutinefunction(callback):
+                            await callback(device_id)
+                        else:
+                            callback(device_id)
+                    except Exception as e:
+                        log.warning("Device disconnected callback failed: %s", e)
 
             if removed_count > 0:
-                # Mark config as dirty for autosave
                 self.mark_dirty()
-
         except Exception as e:
             log.error("Failed to handle device removal: %s", e)
 
