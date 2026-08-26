@@ -1,238 +1,155 @@
 /**
- * Audio routing page: device list + connection controls for USB audio.
- * Shown on the Routing tab when operating_mode === 'audio' (the modes are
- * mutually exclusive — the MIDI matrix is not rendered in audio mode).
+ * Audio routing page (operating_mode === 'audio').
  *
- * Channel routing: once source and destination are picked, every REAL JACK
- * port (from jack_lsp, exposed via /api/audio/devices) appears as a
- * checkbox on its side. Checked outputs are paired positionally with
- * checked inputs and sent to the backend as an explicit full-port-name
- * mapping — no synthesised names involved anywhere.
+ * Reuses the EXACT same routing surfaces as MIDI mode — ConnectionMatrix
+ * and RackView — fed with matrix-shaped data from /api/audio/devices and
+ * /api/audio/connections. Each matrix cell is one real JACK wire
+ * (source output channel → destination input channel); tap a cell for
+ * Add/Remove. Devices appear as rows/columns of their live JACK ports
+ * ("Ch N"). Filters/mappings/plugins/Bluetooth are MIDI concepts and
+ * deliberately absent here; Save/Load Config persist the audio graph
+ * through the normal config pipeline.
  */
 
 import { useState, useEffect, useCallback } from '../lib/hooks.module.js';
-import { html, api } from '../ui/common.js';
+import { html } from '../ui/common.js';
+import { ConnectionMatrix } from './matrix.js';
+import { RackView } from './rack.js';
+import { cableColor } from '../ui/connections.js';
 
-/** Channel label for a full "client:port" jack name → "Ch N". */
-function chLabel(fullName) {
-    const m = fullName.match(/(\d+)\s*$/);
-    return m ? `Ch ${m[1]}` : fullName;
-}
+// Same key the MIDI routing page uses — one display preference across
+// both modes.
+const VIEW_KEY = 'raspimidihub:routingView';
+function loadView() { try { return localStorage.getItem(VIEW_KEY) === 'rack' ? 'rack' : 'matrix'; } catch { return 'matrix'; } }
+function saveView(v) { try { localStorage.setItem(VIEW_KEY, v); } catch {} }
 
-function portsFor(devices, deviceId, direction) {
-    const dev = devices.find(d => d.device_id === deviceId);
-    if (!dev || !Array.isArray(dev.ports)) return [];
-    return dev.ports
-        .filter(p => p.direction === direction && p.type !== 'midi')
-        .map(p => p.name)
-        .sort();
-}
-
-function toggleSet(set, value) {
-    const next = Object.assign({}, set);
-    if (next[value]) delete next[value];
-    else next[value] = true;
-    return next;
-}
-
-export function AudioRouting({ showToast }) {
+export function AudioRouting({ showToast, showContextMenu }) {
     const [devices, setDevices] = useState([]);
     const [connections, setConnections] = useState([]);
-    const [selectedSource, setSelectedSource] = useState('');
-    const [selectedDest, setSelectedDest] = useState('');
-    // Selected FULL port names per side (object used as a set)
-    const [srcSel, setSrcSel] = useState({});
-    const [dstSel, setDstSel] = useState({});
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState(null);
+    const [view, setViewState] = useState(loadView());
+    const setView = (v) => { setViewState(v); saveView(v); };
 
-    const loadAudioData = useCallback(async () => {
-        setLoading(true);
-        setError(null);
+    const refresh = useCallback(async () => {
         try {
-            const devs = await api('/audio/devices');
-            if (devs.error) throw new Error(devs.error);
+            const [devs, conns] = await Promise.all([
+                fetch('/api/audio/devices').then(r => r.json()),
+                fetch('/api/audio/connections').then(r => r.json()),
+            ]);
             setDevices(Array.isArray(devs) ? devs : []);
-
-            const conns = await api('/audio/connections');
-            if (conns.error) throw new Error(conns.error);
             setConnections(Array.isArray(conns) ? conns : []);
-        } catch (err) {
-            setError(err.message || 'Failed to load audio data');
-        } finally {
-            setLoading(false);
+        } catch (e) {
+            console.warn('audio routing refresh failed:', e);
         }
     }, []);
 
-    useEffect(() => { loadAudioData(); }, [loadAudioData]);
+    useEffect(() => { refresh(); }, [refresh]);
 
-    // Which JACK ports each side offers, from live discovery data.
-    const srcPorts = portsFor(devices, selectedSource, 'output');
-    const dstPorts = portsFor(devices, selectedDest, 'input');
+    // Server pushes after every create/delete/hotplug — mirror the MIDI
+    // page's lifecycle (App-level refresh targets the MIDI endpoints,
+    // which answer [] in audio mode, so this page listens directly).
+    useEffect(() => {
+        const es = new EventSource('/api/events');
+        const h = () => refresh();
+        es.addEventListener('connection-changed', h);
+        es.addEventListener('device-connected', h);
+        es.addEventListener('device-disconnected', h);
+        es.addEventListener('config-dirty', h);
+        return () => es.close();
+    }, [refresh]);
 
-    function selectSource(id) {
-        setSelectedSource(id);
-        setSrcSel({});
-    }
-
-    function selectDest(id) {
-        setSelectedDest(id);
-        setDstSel({});
-    }
-
-    async function createConnection() {
-        if (!selectedSource || !selectedDest) return;
-        const outs = srcPorts.filter(p => srcSel[p]).sort();
-        const ins = dstPorts.filter(p => dstSel[p]).sort();
-        if (!outs.length || !ins.length) return;
-
-        // Positional pairing, same ordering rule the engine's auto path
-        // uses; extra channels on either side are simply not wired.
-        const n = Math.min(outs.length, ins.length);
-        const mapping = {};
-        for (let i = 0; i < n; i++) mapping[outs[i]] = ins[i];
-
-        try {
-            const res = await api('/audio/connections', {
-                method: 'POST',
-                body: JSON.stringify({
-                    source_device: selectedSource,
-                    dest_device: selectedDest,
-                    channel_mapping: mapping,
-                }),
+    const onToggle = async (inp, out, connect) => {
+        if (connect) {
+            await apiPost('/api/audio/connections', {
+                src_client: inp.client_id, src_port: inp.port_id,
+                dst_client: out.client_id, dst_port: out.port_id,
             });
-            if (res.error) throw new Error(res.error);
-            showToast && showToast(
-                outs.length !== ins.length
-                    ? `Connected ${n} ch (${outs.length} out vs ${ins.length} in)`
-                    : `Connected ${n} ch`);
-            setSelectedSource('');
-            setSelectedDest('');
-            setSrcSel({});
-            setDstSel({});
-            await loadAudioData();
-        } catch (err) {
-            setError(err.message || 'Failed to create connection');
+        } else {
+            const conn = connections.find(c =>
+                c.src_client === inp.client_id && c.src_port === inp.port_id
+                && c.dst_client === out.client_id && c.dst_port === out.port_id);
+            if (!conn) return;
+            await fetch(`/api/audio/connections/${encodeURIComponent(conn.id)}`,
+                { method: 'DELETE' });
         }
-    }
-
-    async function deleteConnection(id) {
-        try {
-            const res = await api(`/audio/connections/${id}`, { method: 'DELETE' });
-            if (res.error) throw new Error(res.error);
-            showToast && showToast('Connection removed');
-            await loadAudioData();
-        } catch (err) {
-            setError(err.message || 'Failed to delete connection');
-        }
-    }
-
-    const inputDevices = devices.filter(d => d.has_capture);
-    const outputDevices = devices.filter(d => d.has_playback);
-    const readyCount = Math.min(
-        srcPorts.filter(p => srcSel[p]).length,
-        dstPorts.filter(p => dstSel[p]).length);
-
-    function devName(id) {
-        const d = devices.find(x => x.device_id === id);
-        return d ? d.name : id;
-    }
-
-    const portBoxStyle = {
-        border: '1px solid var(--border)',
-        borderRadius: '8px',
-        padding: '0.5rem',
-        maxHeight: '9rem',
-        overflowY: 'auto',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: '0.25rem',
+        refresh();
     };
 
-    function PortPicker({ title, ports, sel, onChange }) {
-        return html`
-            <div class="form-group">
-                <label>${title} (${ports.filter(p => sel[p]).length}/${ports.length})</label>
-                <div style=${portBoxStyle}>
-                    ${ports.map(p => html`
-                        <label key=${p} style="display:flex;align-items:center;gap:0.4rem">
-                            <input type="checkbox" checked=${!!sel[p]}
-                                   onchange=${() => onChange(toggleSet(sel, p))} />
-                            <span>${chLabel(p)}</span>
-                        </label>`)}
-                    ${ports.length === 0 && html`<span class="muted">No ports online</span>`}
-                </div>
-            </div>`;
-    }
+    const endpointLabel = (item, role) =>
+        `${item.dev_name || '?'} · ${role === 'out' ? 'OUT' : 'IN'}`;
+
+    const cellMenuItems = (inp, out, conn) => {
+        const header = {
+            header: true,
+            label: `${endpointLabel(inp, 'out')}  →  ${endpointLabel(out, 'in')}`,
+            color: cableColor(inp.stable_id, inp.port_id),
+        };
+        if (conn) {
+            return [
+                header, { divider: true },
+                { label: 'Remove', action: () => onToggle(inp, out, false), danger: true },
+            ];
+        }
+        return [
+            header, { divider: true },
+            { label: 'Add connection', action: () => onToggle(inp, out, true) },
+        ];
+    };
+
+    const headerMenuItems = (item /* , role, fullLabel */) => [
+        { header: true, label: item.dev_name },
+        { divider: true },
+    ];
+
+    const saveConfig = async () => {
+        try {
+            const res = await fetch('/api/config/save', { method: 'POST' })
+                .then(r => r.json());
+            showToast(res && res.status === 'saved'
+                ? 'Configuration saved'
+                : (res && res.error) || 'Save failed — try again');
+        } catch {
+            showToast('Save failed — try again');
+        }
+    };
 
     return html`
-        <div class="audio-routing">
-            ${error ? html`<div class="banner">${error}</div>` : ''}
-            ${loading ? html`<div class="card"><p>Loading audio devices…</p></div>` : ''}
+        <div class="view-toggle">
+            <button class="view-toggle-btn ${view === 'matrix' ? 'active' : ''}"
+                    onclick=${() => setView('matrix')}>Matrix</button>
+            <button class="view-toggle-btn ${view === 'rack' ? 'active' : ''}"
+                    onclick=${() => setView('rack')}>Rack</button>
+        </div>
+        ${view === 'rack'
+            ? html`<${RackView} devices=${devices} connections=${connections}
+                clockSources=${{}} clockQuarters=${null} midiRates=${null}
+                onToggle=${onToggle}
+                getCellMenuItems=${cellMenuItems}
+                getHeaderMenuItems=${headerMenuItems}
+                showContextMenu=${showContextMenu} />`
+            : html`<${ConnectionMatrix} devices=${devices} connections=${connections}
+                clockSources=${{}} clockQuarters=${null} midiRates=${null}
+                onAddPlugin=${null}
+                getCellMenuItems=${cellMenuItems}
+                getHeaderMenuItems=${headerMenuItems}
+                showContextMenu=${showContextMenu} />`}
+        <div class="btn-group">
+            <button class="btn btn-primary" onclick=${saveConfig}>Save Config</button>
+        </div>
+        <p style="font-size:11px;color:var(--text-dim);text-align:center;margin-top:4px">
+            Audio mode: each cell wires one source channel to one destination channel.
+        </p>
+    `;
+}
 
-            <div class="card">
-                <h3>New connection</h3>
-                ${inputDevices.length === 0
-                    ? html`<p>No input-capable audio devices found.</p>`
-                    : html`
-                        <div class="form-group">
-                            <label for="aud-src">Source (capture)</label>
-                            <select id="aud-src" value=${selectedSource}
-                                    onchange=${e => selectSource(e.target.value)}>
-                                <option value="">— select input —</option>
-                                ${inputDevices.map(d => html`<option value=${d.device_id}>${d.name}</option>`)}
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label for="aud-dst">Destination (playback)</label>
-                            <select id="aud-dst" value=${selectedDest}
-                                    onchange=${e => selectDest(e.target.value)}>
-                                <option value="">— select output —</option>
-                                ${outputDevices.map(d => html`<option value=${d.device_id}>${d.name}</option>`)}
-                            </select>
-                        </div>
-                        ${(srcPorts.length > 0 && dstPorts.length > 0) ? html`
-                            <div style="display:flex;gap:0.75rem">
-                                <${PortPicker} title="Source out" ports=${srcPorts}
-                                               sel=${srcSel} onChange=${setSrcSel} />
-                                <${PortPicker} title="Destination in" ports=${dstPorts}
-                                               sel=${dstSel} onChange=${setDstSel} />
-                            </div>` : null}
-                        <button class="btn btn-primary"
-                                disabled=${!selectedSource || !selectedDest || !readyCount}
-                                onclick=${createConnection}>
-                            Connect${readyCount ? ` ${readyCount} ch` : ''}
-                        </button>
-                    `}
-            </div>
-
-            <div class="card">
-                <h3>Connections (${connections.length})</h3>
-                ${connections.length === 0
-                    ? html`<p>No audio connections yet.</p>`
-                    : connections.map(c => html`
-                        <div class="aud-row">
-                            <span class="aud-path">
-                                ${devName(c.source_device)} → ${devName(c.dest_device)}
-                                · ${Object.keys(c.channel_mapping || {}).length}ch
-                            </span>
-                            <button class="btn btn-danger"
-                                    onclick=${() => deleteConnection(c.id)}>Delete</button>
-                        </div>
-                    `)}
-            </div>
-
-            <div class="card">
-                <h3>Devices (${devices.length})</h3>
-                ${devices.map(d => html`
-                    <div class="aud-row">
-                        <span>${d.name}</span>
-                        <span class="aud-caps">
-                            ${[d.has_capture && 'in', d.has_playback && 'out'].filter(Boolean).join(' / ') || '—'}
-                            · ${d.channels?.input_count || 0}ch in · ${d.channels?.output_count || 0}ch out
-                        </span>
-                    </div>
-                `)}
-            </div>
-        </div>`;
+async function apiPost(url, body) {
+    try {
+        const r = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        return await r.json();
+    } catch (e) {
+        return { error: String(e) };
+    }
 }

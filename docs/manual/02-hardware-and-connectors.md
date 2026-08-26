@@ -105,33 +105,31 @@ acting as the cable.
 Modes are strictly mutually exclusive -- a hub routes either MIDI or
 audio, never both at once. Switch with **Settings → System → Operating
 mode** (**MIDI / AUDIO**); the change applies immediately without a
-reboot. In audio mode the **Routing** tab shows an *Audio routing*
-page instead of the MIDI matrix.
+reboot. Audio mode shows the SAME routing **matrix** (and **rack**
+view) as MIDI mode, fed with the audio graph instead: each device
+contributes one column per playback input channel and one row per
+capture output channel (labelled *Ch N*), and every cell is one real
+wire between a source channel and a destination channel. Tap a cell
+to add the connection; tap a wired cell to remove exactly that wire.
+The Matrix/Rack toggle is shared with MIDI mode and remembered.
 
 How the graph works, and what to expect:
 
-- Every USB audio card is discovered via ALSA and shown under
-  **Devices** with its channel counts. The hub starts a JACK daemon
-  bound to the first playback-capable USB card (it appears as the
-  `system` client); every *other* USB card is bridged into the graph
-  automatically (`alsa_in` / `alsa_out` from the `jack-example-tools`
-  package) under a stable client name derived from the card name.
-- A connection pairs source output channels with destination input
-  channels. Once you pick a source and a destination, both sides offer
-  a channel checklist of their live JACK ports (labelled *Ch N*); tick
-  what you want and they are paired in the order shown (first-ticked →
-  first-ticked), so ticking only Ch 1 and Ch 3 wires exactly those two.
-  Leave everything unticked and the default is all channels positionally
-  (1→1, 2→2 …); if one side has fewer channels than the other, the
-  extras are left unwired. Create it from **New connection**, remove
-  it again from the row's Delete button. Connections are saved with
-  the config, restored on boot, and re-wired automatically when the
-  devices are re-plugged; note that restore re-pairs by position, so a
-  reordered selection is re-wired as first-to-first against what is
-  online at that moment. If the whole audio graph dies (e.g. the card
-  the daemon held was pulled), the hub rebuilds it by itself within
-  seconds.
-- Levels are straight-through for now: a connection's gain / mute /
+- Every USB audio card is discovered via ALSA and shown in the matrix
+  with its live channels. The hub starts a JACK daemon bound to the
+  first playback-capable USB card (it appears as the `system` client);
+  every *other* USB card is bridged into the graph automatically
+  (`alsa_in` / `alsa_out` from the `jack-example-tools` package) under
+  a stable client name derived from the card name.
+- Wiring is per-channel: tick exactly the cells you want (e.g. Ch 1
+  only, or Ch 1 + Ch 3), with no positional coupling between wires.
+- Wires are saved individually with the config, restored on boot under
+  their port names, and survive replugs and card-number changes; if a
+  device disappears mid-set its wires drop with it and come back by
+  themselves once it reappears. If the whole audio graph dies (e.g.
+  the card the daemon held was pulled), the hub rebuilds it by itself
+  within seconds.
+- Levels are straight-through for now: per-wire gain / mute /
   phase settings are remembered but not yet applied.
 
 Built-in Pi audio (HDMI, headphone jack) deliberately takes no part

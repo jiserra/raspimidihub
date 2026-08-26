@@ -895,21 +895,24 @@ class AudioEngine:
                      source.name, dest.name, len(connected_pairs),
                      "s" if len(connected_pairs) != 1 else "")
 
-            # Notify callbacks
-            for callback in self._on_change_callbacks:
-                try:
-                    if asyncio.iscoroutinefunction(callback):
-                        asyncio.create_task(callback())
-                    else:
-                        callback()
-                except Exception as e:
-                    log.warning("Connection change callback failed: %s", e)
+            self._fire_on_change()
 
             return True
 
         except Exception as e:
             log.error("Failed to create audio connection: %s", e)
             return False
+
+    def _fire_on_change(self):
+        """Fan out a routing change to on_change callbacks."""
+        for callback in self._on_change_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    asyncio.create_task(callback())
+                else:
+                    callback()
+            except Exception as e:
+                log.warning("Connection change callback failed: %s", e)
 
     async def disconnect_devices(self, source_device: str, dest_device: str) -> bool:
         """Remove audio connection between devices.
@@ -966,15 +969,7 @@ class AudioEngine:
                 dst_name = dest.name if dest else dest_device
                 log.info("Audio connection removed: %s -> %s", src_name, dst_name)
 
-                # Notify callbacks
-                for callback in self._on_change_callbacks:
-                    try:
-                        if asyncio.iscoroutinefunction(callback):
-                            asyncio.create_task(callback())
-                        else:
-                            callback()
-                    except Exception as e:
-                        log.warning("Connection change callback failed: %s", e)
+                self._fire_on_change()
 
                 return True
             else:
@@ -984,6 +979,46 @@ class AudioEngine:
         except Exception as e:
             log.error("Failed to remove audio connection: %s", e)
             return False
+
+    async def remove_wire(self, src_port: str, dst_port: str) -> bool:
+        """Remove exactly ONE port wire ({src: dst} within a stored
+        connection), dropping the record when its last wire goes.
+
+        The matrix UI toggles individual cells, i.e. individual jack
+        wires — unlike disconnect_devices which removes a whole
+        device-pair record and everything it carries.
+        """
+        import subprocess
+
+        for conn in self._connections:
+            mapping = conn.channel_mapping or {}
+            if mapping.get(src_port) != dst_port:
+                continue
+
+            try:
+                result = subprocess.run(
+                    ["jack_disconnect", src_port, dst_port],
+                    capture_output=True, text=True, timeout=5)
+                if result.returncode != 0:
+                    log.warning("jack_disconnect refused %s -x- %s: %s",
+                                src_port, dst_port,
+                                (result.stderr or "").strip())
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                log.warning("jack_disconnect failed for %s -x- %s: %s",
+                            src_port, dst_port, e)
+
+            mapping.pop(src_port, None)
+            conn.channel_mapping = mapping
+            self._connections.remove(conn)   # record dropped once empty of wires
+            self.mark_dirty()
+            log.info("Audio wire removed: %s -x- %s", src_port, dst_port)
+
+            self._fire_on_change()
+            return True
+
+        log.warning("Wire not found in saved connections: %s -> %s",
+                    src_port, dst_port)
+        return False
 
     async def remove_connection(self, source_device: str, dest_device: str) -> bool:
         """Remove audio connection (API compatibility method)."""
@@ -1569,10 +1604,14 @@ class AudioEngine:
     def _restore_saved_connections(self):
         """Restore saved audio connections.
 
-        Saved channel_mapping values are a hint only — port numbering can
-        shift between boots (card order, bridge restarts), so each edge
-        re-runs positional auto-discovery against the ports jackd reports
-        RIGHT NOW and reconnects whatever matches.
+        A saved channel_mapping of FULL jack port names is authoritative —
+        the matrix UI wires exactly the cells the user ticked, and a
+        positional auto-discovery here would resurrect channels they left
+        out. Full names also survive card-number churn: ports are matched
+        by name via the live graph, so only genuinely-absent endpoints
+        fail (logged), never re-pair onto different ports. Legacy entries
+        written by the old name-synthesis code ("out_1") carry no usable
+        names and fall back to positional auto-discovery.
         """
         import subprocess
         if not self._connections:
@@ -1586,7 +1625,13 @@ class AudioEngine:
                 source = self._devices[connection.source_device]
                 dest = self._devices[connection.dest_device]
                 try:
-                    port_map = self._auto_discover_port_mapping(source, dest)
+                    mapping = connection.channel_mapping or {}
+                    if mapping and all(
+                            ":" in k and ":" in v
+                            for k, v in mapping.items()):
+                        port_map = dict(mapping)
+                    else:
+                        port_map = self._auto_discover_port_mapping(source, dest)
                     for src_port, dst_port in port_map.items():
                         try:
                             result = subprocess.run(

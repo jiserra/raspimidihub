@@ -527,8 +527,10 @@ function App({ onSpectatorWatched, onRouteChange }) {
         case 'routing':
             if (operatingMode === 'audio') {
                 // Modes are mutually exclusive: the MIDI matrix is not
-                // meaningful in audio mode — show audio routing instead.
-                page = html`<${AudioRouting} showToast=${showToast} />`;
+                // meaningful in audio mode — show audio routing instead
+                // (same matrix/rack surfaces, audio data).
+                page = html`<${AudioRouting} showToast=${showToast}
+                    showContextMenu=${showContextMenu} />`;
             } else {
                 page = html`<${RoutingPage} devices=${devices} connections=${connections} refresh=${refresh} showToast=${showToast} clockSources=${clockSources} clockQuarters=${clockQuarters} midiRates=${midiRates}
                     onDeviceOpen=${(clientId) => setSelectedDeviceId(clientId)}

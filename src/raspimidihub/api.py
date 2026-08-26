@@ -7,8 +7,10 @@ import asyncio
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
+import zlib
 from pathlib import Path
 
 from . import __version__
@@ -2978,15 +2980,84 @@ def register_api(server: WebServer, engine, config: Config,
 
     # ================================================================
     # Audio routing endpoints (only available when operating_mode == "audio")
+    #
+    # These serve the SAME shape the MIDI matrix consumes (client_id /
+    # port_id numbered endpoints, src/dst-keyed connections) so the audio
+    # page can reuse ConnectionMatrix/RackView unchanged. Full jack port
+    # names stay authoritative underneath; the numeric ids are stable
+    # projections maintained here via _audio_matrix_maps().
     # ================================================================
 
-    @server.route("GET", "/api/audio/devices", summary="List audio devices and JACK ports")
+    def _audio_matrix_maps(audio_engine):
+        """(devices_json, port_index) in the routing-matrix's contract.
+
+        port_index maps FULL jack port name ->
+        {client_id, port_id, device_id}. Port semantics follow the MIDI
+        matrix's convention: is_input marks an endpoint you route FROM
+        (a jack *output* port — captured audio flowing into the graph),
+        is_output marks an endpoint you route TO (a jack *input* port —
+        playback fed from the graph).
+
+        Numeric ids are derived deterministically from stable strings, so
+        both serializers (and repeated fetches) agree without shared state.
+        """
+        ports_by_name = {}
+        if hasattr(audio_engine, "_jack_ports"):
+            for p in audio_engine._jack_ports:
+                if p.get("type") != "midi" and \
+                        p.get("direction") in ("input", "output"):
+                    ports_by_name[p["name"]] = p
+
+        devices_json = []
+        port_index = {}
+        for dev in audio_engine.devices:
+            cid = zlib.crc32(dev.device_id.encode("utf-8")) % 90000 + 1000
+            full_names = sorted(
+                n for n, p in ports_by_name.items()
+                if p.get("device") == dev.device_id)
+            ports_list = []
+            for i, fn in enumerate(full_names):
+                from_source = ports_by_name[fn]["direction"] == "output"
+
+                # Row/column label: "Ch N" off the jack name's trailing
+                # digits (fallback: its bare segment). `default_name`
+                # differs deliberately, which makes the matrix treat the
+                # device as multi-port and prefer our short label.
+                m = re.search(r"(\d+)\s*$", fn)
+                label = m.group(1) if m else fn.rsplit(":", 1)[-1]
+
+                ports_list.append({
+                    "port_id": i,
+                    "name": f"Ch {label}",
+                    "default_name": fn.rsplit(":", 1)[-1],
+                    "is_input": from_source,
+                    "is_output": not from_source,
+                })
+                port_index[fn] = {
+                    "client_id": cid,
+                    "port_id": i,
+                    "device_id": dev.device_id,
+                }
+            devices_json.append({
+                "client_id": cid,
+                "stable_id": dev.device_id,
+                "name": dev.name,
+                "default_name": dev.name,
+                "online": True,
+                "has_capture": dev.has_capture,
+                "has_playback": dev.has_playback,
+                "ports": ports_list,
+            })
+        return devices_json, port_index
+
+    @server.route("GET", "/api/audio/devices",
+                  summary="List audio devices in routing-matrix shape")
     async def api_audio_devices(req: Request) -> Response:
-        """List all discovered audio devices and their JACK ports."""
+        """All discovered audio devices and their live JACK ports,
+        shaped like /api/devices so ConnectionMatrix/RackView render them."""
         if config.operating_mode != "audio":
             return Response.error("Audio routing only available in audio mode", 400)
 
-        # Get current engine from engine_manager
         engine_manager = getattr(server, '_engine_manager', None)
         if not engine_manager:
             return Response.error("Engine manager not available", 503)
@@ -2995,37 +3066,15 @@ def register_api(server: WebServer, engine, config: Config,
         if not hasattr(current_engine, 'devices'):
             return Response.error("Audio engine not available", 503)
 
-        result = []
-        for device in current_engine.devices:
-            device_info = {
-                "device_id": device.device_id,
-                "name": device.name,
-                "jack_client_name": device.jack_client_name,
-                "usb_topology": device.usb_topology,
-                "serial": device.serial,
-                "has_capture": device.has_capture,
-                "has_playback": device.has_playback,
-                "channels": device.channels,
-                "ports": []  # Will be populated with JACK ports
-            }
+        devices_json, _ = _audio_matrix_maps(current_engine)
+        return Response.json(devices_json)
 
-            # Get JACK ports for this device if available
-            if hasattr(current_engine, '_jack_ports'):
-                for port in current_engine._jack_ports:
-                    if port.get("device") == device.device_id:
-                        device_info["ports"].append({
-                            "name": port["name"],
-                            "direction": port.get("direction", "unknown"),
-                            "type": port.get("type", "audio")
-                        })
-
-            result.append(device_info)
-
-        return Response.json(result)
-
-    @server.route("GET", "/api/audio/connections", summary="List current audio connections")
+    @server.route("GET", "/api/audio/connections",
+                  summary="List audio wires, one entry per connected "
+                          "endpoint pair")
     async def api_audio_connections_get(req: Request) -> Response:
-        """Get all active audio routing connections."""
+        """Active audio connections flattened to per-wire records keyed
+        like the matrix builds cell keys (src_client:src_port-…)."""
         if config.operating_mode != "audio":
             return Response.error("Audio routing only available in audio mode", 400)
 
@@ -3037,24 +3086,34 @@ def register_api(server: WebServer, engine, config: Config,
         if not hasattr(current_engine, 'connections'):
             return Response.error("Audio engine not available", 503)
 
-        result = []
-        for i, conn in enumerate(current_engine.connections):
-            result.append({
-                "id": i,
-                "source_device": conn.source_device,
-                "dest_device": conn.dest_device,
-                "channel_mapping": conn.channel_mapping,
-                "enabled": conn.enabled,
-                "gain": conn.gain,
-                "muted": conn.muted,
-                "phase_invert": conn.phase_invert
-            })
+        _, port_index = _audio_matrix_maps(current_engine)
 
+        result = []
+        for conn in current_engine.connections:
+            for s, d in (conn.channel_mapping or {}).items():
+                pe = port_index.get(s)
+                pd = port_index.get(d)
+                if not pe or not pd:
+                    continue  # endpoint currently absent from the graph
+                result.append({
+                    "id": f"{s}->{d}",
+                    "src_client": pe["client_id"],
+                    "src_port": pe["port_id"],
+                    "dst_client": pd["client_id"],
+                    "dst_port": pd["port_id"],
+                })
         return Response.json(result)
 
-    @server.route("POST", "/api/audio/connections", summary="Create audio connection")
+    @server.route("POST", "/api/audio/connections", summary="Connect one audio channel pair")
     async def api_audio_connections_post(req: Request) -> Response:
-        """Create a new audio routing connection between devices."""
+        """Wire ONE source port to ONE destination port (one matrix cell).
+
+        Body: {src_client, src_port, dst_client, dst_port} — the numeric
+        endpoint ids the matrix handed us. Idempotent: wiring an already-
+        wired cell answers 200 {"status":"exists"} instead of duplicating
+        the record. The legacy {source_device, dest_device, channel_mapping}
+        body from the old form UI is still accepted.
+        """
         if config.operating_mode != "audio":
             return Response.error("Audio routing only available in audio mode", 400)
 
@@ -3067,15 +3126,37 @@ def register_api(server: WebServer, engine, config: Config,
             return Response.error("Audio engine not available", 503)
 
         data = req.json
-        source_device = data.get("source_device")
-        dest_device = data.get("dest_device")
-        channel_mapping = data.get("channel_mapping", {})
+
+        if "src_client" in data:
+            _, port_index = _audio_matrix_maps(current_engine)
+            rev = {(v["client_id"], v["port_id"]): k
+                   for k, v in port_index.items()}
+            se = rev.get((data.get("src_client"), data.get("src_port")))
+            de = rev.get((data.get("dst_client"), data.get("dst_port")))
+            if not se or not de:
+                return Response.error("Unknown audio endpoint(s)", 400)
+            src_full, dst_full = se, de
+
+            for conn in current_engine.connections:
+                if (conn.channel_mapping or {}).get(src_full) == dst_full:
+                    await server.send_sse("connection-changed",
+                                          {"action": "noop"})
+                    return Response.json({"status": "exists"})
+
+            source_device = port_index[src_full]["device_id"]
+            dest_device = port_index[dst_full]["device_id"]
+            channel_mapping = {src_full: dst_full}
+        else:
+            source_device = data.get("source_device")
+            dest_device = data.get("dest_device")
+            channel_mapping = data.get("channel_mapping", {})
 
         if not source_device or not dest_device:
-            return Response.error("source_device and dest_device required")
+            return Response.error("Endpoint fields required")
 
         try:
-            success = await current_engine.connect_devices(source_device, dest_device, channel_mapping)
+            success = await current_engine.connect_devices(
+                source_device, dest_device, channel_mapping)
             if success:
                 # Serialize via the engine (dataclasses → plain dicts) —
                 # raw AudioConnection objects aren't JSON-serializable.
@@ -3084,7 +3165,8 @@ def register_api(server: WebServer, engine, config: Config,
                 current_engine.mark_dirty()
                 # Fan out like the MIDI path does so other open tabs
                 # re-fetch and see the new edge.
-                await server.send_sse("connection-changed", {"action": "created"})
+                await server.send_sse("connection-changed",
+                                      {"action": "created"})
                 return Response.json({"status": "created"}, 201)
             else:
                 return Response.error(
@@ -3093,9 +3175,12 @@ def register_api(server: WebServer, engine, config: Config,
         except Exception as e:
             return Response.error(f"Connection failed: {str(e)}", 500)
 
-    @server.route("DELETE", "/api/audio/connections/", exact=False, summary="Remove audio connection")
+    @server.route("DELETE", "/api/audio/connections/", exact=False,
+                  summary="Unwire one audio channel pair by id")
     async def api_audio_connections_delete(req: Request) -> Response:
-        """Remove an audio connection by ID."""
+        """Remove exactly one wire. Ids are "<src_full>-><dst_full>"
+        (jack port names are shell-safe, so the composite needs no
+        escaping beyond URL encoding)."""
         if config.operating_mode != "audio":
             return Response.error("Audio routing only available in audio mode", 400)
 
@@ -3104,32 +3189,25 @@ def register_api(server: WebServer, engine, config: Config,
             return Response.error("Engine manager not available", 503)
 
         current_engine = engine_manager.get_engine()
-        if not hasattr(current_engine, 'remove_connection'):
+        if not hasattr(current_engine, 'remove_wire'):
             return Response.error("Audio engine not available", 503)
 
         conn_id = req.path_param("/api/audio/connections/")
-        if not conn_id:
+        if not conn_id or "->" not in conn_id:
             return Response.error("Connection ID required")
 
+        src_full, _, dst_full = conn_id.partition("->")
+
         try:
-            conn_id = int(conn_id)
-            if conn_id < 0 or conn_id >= len(current_engine.connections):
-                return Response.error("Connection not found", 404)
-
-            connection = current_engine.connections[conn_id]
-            source_device = connection.source_device
-            dest_device = connection.dest_device
-
-            success = await current_engine.remove_connection(source_device, dest_device)
+            success = await current_engine.remove_wire(src_full, dst_full)
             if success:
                 current_engine._save_audio_routing_config(config.data)
                 await config.asave()
                 current_engine.mark_dirty()
-                await server.send_sse("connection-changed", {"action": "deleted"})
+                await server.send_sse("connection-changed",
+                                      {"action": "deleted"})
                 return Response.json({"status": "deleted"})
             else:
-                return Response.error("Failed to remove audio connection", 500)
-        except ValueError:
-            return Response.error("Invalid connection ID", 400)
+                return Response.error("Wire not found", 404)
         except Exception as e:
             return Response.error(f"Deletion failed: {str(e)}", 500)

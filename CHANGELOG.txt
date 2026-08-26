@@ -7,15 +7,13 @@ hashes. Tags: Added, Improved, Fix, Changed, Removed.
 Unreleased
 
 - Added: **Audio routing mode.** Settings → System can switch the hub
-  between MIDI and AUDIO (mutually exclusive, no reboot); in audio mode
-  the Routing tab shows an audio page that pipes one USB audio gadget's
-  output into another's through the Pi. jackd binds one USB card as the
-  graph owner, every other USB card is bridged in automatically;
-  connections persist and re-wire across reboots, replugs and audio-
-  graph crashes. Each connection can pick exactly which output channels
-  of the source feed which input channels of the destination (live
-  channel checklists on both sides; all channels positionally by
-  default). Per-connection gain/mute are stored but not applied yet.
+  between MIDI and AUDIO (mutually exclusive, no reboot); audio routing
+  reuses the same matrix/rack view as MIDI — every cell is one wire
+  from a source channel (Ch N) to a destination channel, so any subset
+  of channels can be wired freely. jackd binds one USB card as the
+  graph owner, every other USB card is bridged in automatically; wires
+  persist by name and re-wire across reboots, replugs and audio-graph
+  crashes. Per-wire gain/mute are stored but not applied yet.
 
 
 2026-08-10 — Version 6.0.0a4
