@@ -33,7 +33,8 @@ class AudioDevice:
     channels: Dict = None  # Channel information {channel_name: properties}
     usb_topology: str = ""  # USB bus/port path for stable ID
     serial: str = ""  # USB serial number if available
-    jack_client_name: str = ""  # JACK client name
+    jack_client_name: str = ""  # Primary JACK client name ("")
+    jack_client_names: List[str] = None  # ALL JACK clients carrying this card ('system', or one per bridge direction)
     has_capture: bool = False  # Device has capture (input) capability
     has_playback: bool = True  # Device has playback (output) capability
 
@@ -46,6 +47,8 @@ class AudioDevice:
             self.sample_rates = [44100, 48000]  # Common rates
         if self.channels is None:
             self.channels = {}
+        if self.jack_client_names is None:
+            self.jack_client_names = []
 
 
 @dataclass
@@ -137,7 +140,7 @@ class AudioEngine:
         self._jack_errfile = None                        # jackd stderr (read on death for diagnosis)
         self._bridge_errfiles: Dict[str, object] = {}    # bridge client name -> stderr file
         self._next_graph_retry = 0.0                     # monotonic time of next bring-up retry
-        self._jack_clients_by_card: Dict[int, str] = {}  # card_num -> jack client name
+        self._jack_clients_by_card: Dict[int, List[str]] = {}  # card_num -> its JACK client names
         self._card_of_device: Dict[str, int] = {}        # device_id -> ALSA card num
         self._jack_was_external = False                  # True if jackd was already running at start
 
@@ -267,7 +270,7 @@ class AudioEngine:
                 if not jack_running:
                     self._bridge_secondary_cards(alsa_devices, owner_card)
                     if owner_card is not None:
-                        self._jack_clients_by_card[owner_card] = "system"
+                        self._jack_clients_by_card[owner_card] = ["system"]
             else:
                 if self._jack_proc is not None and self._jack_proc.poll() is None:
                     log.warning("jackd running but not answering yet — "
@@ -428,10 +431,12 @@ class AudioEngine:
     def _apply_jack_client_names(self):
         """Stamp the resolved JACK client names onto the live AudioDevice
         objects using the device_id -> card map recorded at discovery.
-        Devices without a matching card get '' — they cannot be routed."""
+        Devices without a matching card get no names — unroutable."""
         for device_id, dev in self._devices.items():
             card = self._card_of_device.get(device_id)
-            dev.jack_client_name = self._jack_clients_by_card.get(card, "")
+            names = list(self._jack_clients_by_card.get(card, []))
+            dev.jack_client_names = names
+            dev.jack_client_name = names[0] if names else ""
 
     def _bridge_secondary_cards(self, devices: List[dict], owner_card: int):
         """Spawn alsa_in / alsa_out bridges so every OTHER USB card shows
@@ -447,72 +452,82 @@ class AudioEngine:
             want_capture = bool(dev.get("has_capture"))
             want_playback = bool(dev.get("has_playback"))
 
-            tool = None
-            args = []
-            role = ""
-            if want_capture:
-                tool, role = "alsa_in", "capture"
-                args = ["alsa_in", "-j", base, "-d", f"hw:{card}",
-                        "-r", "48000", "-c", "2", "-n", "2", "-q", "1"]
-            elif want_playback:
-                tool, role = "alsa_out", "playback"
-                args = ["alsa_out", "-j", base, "-d", f"hw:{card}",
-                        "-r", "48000", "-c", "2", "-n", "2", "-q", "1"]
-            if tool is None:
-                continue
-
             import shutil
-            path = shutil.which(tool)
-            if path is None:
-                if tool not in missing:
-                    missing.append(tool)
-                continue
-
             import subprocess
-            errf = tempfile.TemporaryFile()
-            try:
-                proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                                        stderr=errf,
-                                        start_new_session=True)
-            except OSError as e:
-                log.warning("Failed to spawn %s for card %d: %s", tool, card, e)
-                errf.close()
+
+            # A card is neither inherently source nor destination — bridge
+            # EVERY direction it offers so the routing matrix can pick.
+            #   alsa_out : JACK -> card playback  (destination side)
+            #   alsa_in  : card capture -> JACK   (source side)
+            bridges = []
+            if want_playback:
+                # Carries the plain client name; destination gadgets are the
+                # common case and unsuffixed reads best in port listings.
+                bridges.append(("alsa_out", "playback", base))
+            if want_capture:
+                bridges.append(("alsa_in", "capture", f"{base}-in"))
+            if not bridges:
                 continue
 
-            # A spawned process is not a working bridge. `alsa_in` starts
-            # fine with no JACK server anywhere and dies a few seconds later;
-            # only treat this as success once its client actually registers
-            # with the server (or it provably keeps running).
-            registered = False
-            for _ in range(6):                    # up to ~3 s
-                time.sleep(0.5)
-                if proc.poll() is not None:
-                    break
+            def spawn_bridge(tool: str, role: str, cname: str) -> bool:
+                args = [tool, "-j", cname, "-d", f"hw:{card}",
+                        "-r", "48000", "-c", "2", "-n", "2", "-q", "1"]
+                path = shutil.which(tool)
+                if path is None:
+                    if tool not in missing:
+                        missing.append(tool)
+                    return False
+                errf = tempfile.TemporaryFile()
                 try:
-                    lsp = subprocess.run(["jack_lsp"], capture_output=True, timeout=1)
-                except (FileNotFoundError, subprocess.TimeoutExpired):
-                    continue
-                if lsp.returncode == 0 and any(
-                        line.split(":", 1)[0] == base
-                        for line in (lsp.stdout or b"").decode("utf-8", "replace").splitlines()):
-                    registered = True
-                    break
+                    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                            stderr=errf,
+                                            start_new_session=True)
+                except OSError as e:
+                    log.warning("Failed to spawn %s for card %d: %s",
+                                tool, card, e)
+                    errf.close()
+                    return False
 
-            if not registered:
-                rc_note = (f"exited rc={proc.returncode}"
-                           if proc.poll() is not None else "never registered")
-                log.warning("%s for card %d failed (%s)%s",
-                            tool, card, rc_note, self._read_err_tail(errf))
-                if proc.poll() is None:           # alive but useless — stop it
-                    proc.terminate()
-                errf.close()
-                continue
+                # A spawned process is not a working bridge. `alsa_in` starts
+                # fine with no JACK server anywhere and dies seconds later;
+                # only success counts once the client actually registers.
+                registered = False
+                for _ in range(6):                # up to ~3 s
+                    time.sleep(0.5)
+                    if proc.poll() is not None:
+                        break
+                    try:
+                        lsp = subprocess.run(["jack_lsp"], capture_output=True,
+                                             timeout=1)
+                    except (FileNotFoundError, subprocess.TimeoutExpired):
+                        continue
+                    if lsp.returncode == 0 and any(
+                            line.split(":", 1)[0] == cname
+                            for line in (lsp.stdout or b"").decode(
+                                "utf-8", "replace").splitlines()):
+                        registered = True
+                        break
 
-            self._bridge_procs[base] = proc
-            self._bridge_errfiles[base] = errf
-            self._jack_clients_by_card[card] = base
-            log.info("Bridged card %d (%s) via %s as client '%s'",
-                     card, dev.get("name"), role, base)
+                if not registered:
+                    rc_note = (f"exited rc={proc.returncode}"
+                               if proc.poll() is not None else "never registered")
+                    log.warning("%s for card %d failed (%s)%s",
+                                tool, card, rc_note, self._read_err_tail(errf))
+                    if proc.poll() is None:       # alive but useless — stop it
+                        proc.terminate()
+                    errf.close()
+                    return False
+
+                self._bridge_procs[cname] = proc
+                self._bridge_errfiles[cname] = errf
+                log.info("Bridged card %d (%s) via %s as client '%s'",
+                         card, dev.get("name"), role, cname)
+                return True
+
+            created = [cname for tool, role, cname in bridges
+                       if spawn_bridge(tool, role, cname)]
+            if created:
+                self._jack_clients_by_card[card] = created
 
         if missing:
             log.warning("%s not found — install jack-example-tools to route "
@@ -747,9 +762,9 @@ class AudioEngine:
         return ports
 
     def _find_device_by_jack_name(self, jack_name: str) -> Optional[str]:
-        """Find device ID by JACK client name."""
+        """Find device ID by any of its JACK client names."""
         for device_id, device in self._devices.items():
-            if device.jack_client_name == jack_name:
+            if jack_name in device.jack_client_names:
                 return device_id
         return None
 
@@ -782,7 +797,7 @@ class AudioEngine:
             # Resolve which real JACK ports carry this edge.
             if channel_mapping:
                 port_map = dict(channel_mapping)
-            elif not source.jack_client_name or not dest.jack_client_name:
+            elif not source.jack_client_names or not dest.jack_client_names:
                 log.warning("Cannot route %s -> %s: no JACK client bound "
                             "(missing bridge? card unowned?)",
                             source.name, dest.name)
@@ -881,7 +896,7 @@ class AudioEngine:
                         ":" in k and ":" in v
                         for k, v in connection.channel_mapping.items()):
                     port_map = connection.channel_mapping
-                elif source and dest and source.jack_client_name and dest.jack_client_name:
+                elif source and dest and source.jack_client_names and dest.jack_client_names:
                     port_map = self._auto_discover_port_mapping(source, dest)
 
                 if port_map:
@@ -933,22 +948,23 @@ class AudioEngine:
         input ports positionally (1->1, 2->2 ...), using REAL ports observed
         from jack_lsp — never synthesised names.
 
+        A device may span several JACK clients (owner 'system', or one bridge
+        per direction); ports from any of them qualify.
+
         Returns a dict of FULL port names {src_full_name: dst_full_name},
         sized to whichever side has fewer ports.
         """
-        src_client = source.jack_client_name
-        dst_client = dest.jack_client_name
-        if not src_client or not dst_client:
+        if not source.jack_client_names or not dest.jack_client_names:
             return {}
 
         source_outputs = sorted(
             p["name"] for p in self._jack_ports
             if p.get("direction") == "output"
-            and p["name"].split(":", 1)[0] == src_client)
+            and p["name"].split(":", 1)[0] in source.jack_client_names)
         dest_inputs = sorted(
             p["name"] for p in self._jack_ports
             if p.get("direction") == "input"
-            and p["name"].split(":", 1)[0] == dst_client)
+            and p["name"].split(":", 1)[0] in dest.jack_client_names)
 
         n = min(len(source_outputs), len(dest_inputs))
         mapping = {}
