@@ -31,6 +31,18 @@ from .wifi import WifiManager
 log = logging.getLogger("raspimidihub")
 
 
+# Engine factory function - module level for API access
+def create_engine(mode: str, **kwargs) -> object:
+    """Create the appropriate engine based on mode."""
+    if mode == "audio":
+        log.info("Creating AudioEngine")
+        from .audio_engine import AudioEngine
+        return AudioEngine()
+    else:  # midi mode (default)
+        log.info("Creating MidiEngine")
+        return MidiEngine()
+
+
 def setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -97,17 +109,6 @@ async def async_main() -> None:
     config = Config()
     wifi = WifiManager()
     plugin_host = PluginHost()
-
-    # Engine factory function for creating the appropriate engine
-    def create_engine(mode: str, **kwargs) -> object:
-        """Create the appropriate engine based on mode."""
-        if mode == "audio":
-            log.info("Creating AudioEngine")
-            from .audio_engine import AudioEngine
-            return AudioEngine()
-        else:  # midi mode (default)
-            log.info("Creating MidiEngine")
-            return MidiEngine()
 
     # Initialize engine manager with the default mode
     from .engine_manager import EngineManager
