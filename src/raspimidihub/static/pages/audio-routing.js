@@ -74,15 +74,7 @@ export function AudioRouting({ showToast, showContextMenu }) {
         refresh();
     };
 
-    const endpointLabel = (item, role) =>
-        `${item.dev_name || '?'} · ${role === 'out' ? 'OUT' : 'IN'}`;
-
     const cellMenuItems = (inp, out, conn) => {
-        const header = {
-            header: true,
-            label: `${endpointLabel(inp, 'out')}  →  ${endpointLabel(out, 'in')}`,
-            color: cableColor(inp.stable_id, inp.port_id),
-        };
         if (conn) {
             return [
                 header, { divider: true },

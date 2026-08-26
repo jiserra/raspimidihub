@@ -3008,28 +3008,41 @@ def register_api(server: WebServer, engine, config: Config,
                         p.get("direction") in ("input", "output"):
                     ports_by_name[p["name"]] = p
 
+        def _sort_key(full):
+            # Natural/numeric order inside one client: playback_2 must
+            # come before playback_10. Grouped by client name first so a
+            # device's ports stay adjacent.
+            client, _, seg = full.rpartition(":")
+            m = re.search(r"(\d+)", seg)
+            return (client, int(m.group(1)) if m else -1, seg)
+
         devices_json = []
         port_index = {}
         for dev in audio_engine.devices:
             cid = zlib.crc32(dev.device_id.encode("utf-8")) % 90000 + 1000
+            clients = set(getattr(dev, "jack_client_names", None)
+                          or ([dev.jack_client_name]
+                              if getattr(dev, "jack_client_name", "") else []))
             full_names = sorted(
-                n for n, p in ports_by_name.items()
-                if p.get("device") == dev.device_id)
+                (fn for fn in ports_by_name
+                 if fn.split(":", 1)[0] in clients),
+                key=_sort_key)
             ports_list = []
             for i, fn in enumerate(full_names):
                 from_source = ports_by_name[fn]["direction"] == "output"
 
-                # Row/column label: "Ch N" off the jack name's trailing
-                # digits (fallback: its bare segment). `default_name`
-                # differs deliberately, which makes the matrix treat the
-                # device as multi-port and prefer our short label.
-                m = re.search(r"(\d+)\s*$", fn)
-                label = m.group(1) if m else fn.rsplit(":", 1)[-1]
+                # Channel number off the segment's trailing digits.
+                seg = fn.rsplit(":", 1)[-1]
+                m = re.search(r"(\d+)", seg)
+                ch = m.group(1) if m else seg
 
+                # Label carries the device name — the matrix shows the
+                # port label verbatim for multi-port devices, and bare
+                # "Ch N" made M8 rows indistinguishable from EP40 rows.
                 ports_list.append({
                     "port_id": i,
-                    "name": f"Ch {label}",
-                    "default_name": fn.rsplit(":", 1)[-1],
+                    "name": f"{dev.name} Ch {ch}",
+                    "default_name": seg,
                     "is_input": from_source,
                     "is_output": not from_source,
                 })
