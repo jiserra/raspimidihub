@@ -318,8 +318,6 @@ class AudioEngine:
 
         return None
 
-    def _scan_alsa_devices(self) -> List[dict]:
-
     def _discover_audio_devices(self):
         """Discover audio devices via ALSA and JACK.
 
@@ -350,8 +348,6 @@ class AudioEngine:
 
         except Exception as e:
             log.error("Audio device discovery failed: %s", e)
-
-    def _scan_alsa_devices(self) -> List[dict]:
         """Scan for ALSA audio devices from /proc/asound."""
         devices = []
         try:
