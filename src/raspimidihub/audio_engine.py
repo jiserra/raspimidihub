@@ -30,6 +30,8 @@ class AudioDevice:
     usb_topology: str = ""  # USB bus/port path for stable ID
     serial: str = ""  # USB serial number if available
     jack_client_name: str = ""  # JACK client name
+    has_capture: bool = False  # Device has capture (input) capability
+    has_playback: bool = True  # Device has playback (output) capability
 
     def __post_init__(self):
         if self.inputs is None:
@@ -776,7 +778,9 @@ class AudioEngine:
                 channels=channels,
                 usb_topology=usb_topology,
                 serial=serial,
-                jack_client_name=device_name.replace(" ", "_").replace("/", "_")
+                jack_client_name=device_name.replace(" ", "_").replace("/", "_"),
+                has_capture=has_capture,
+                has_playback=has_playback
             )
 
             return device
