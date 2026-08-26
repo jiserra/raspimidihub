@@ -95,6 +95,7 @@ class AudioEngine:
         # Audio routing settings
         self._sample_rate = 48000
         self._buffer_size = 128
+        self._jack_ports: List[dict] = []  # Discovered JACK ports
 
         # Callbacks
         self._on_change_callbacks: List[Callable] = []
@@ -341,16 +342,16 @@ class AudioEngine:
             alsa_devices = self._scan_alsa_devices()
             log.info("Found %d ALSA audio devices", len(alsa_devices))
 
-            # Discover JACK ports (if JACK client is active)
-            if self._jack_client:
-                jack_ports = self._scan_jack_ports()
-                log.info("Found %d JACK ports", len(jack_ports))
+            # Discover JACK ports (always scan, even if JACK client not active)
+            self._jack_ports = self._scan_jack_ports()
+            log.info("Found %d JACK ports", len(self._jack_ports))
 
             # Create AudioDevice objects from discovered hardware
             for alsa_device in alsa_devices:
                 device = self._create_audio_device_from_alsa(alsa_device)
                 if device:
                     self._devices[device.device_id] = device
+                    log.info("Registered audio device: %s (%s)", device.name, device.device_id)
                     log.info("Registered audio device: %s (%s)", device.name, device.device_id)
 
             # Notify callbacks
@@ -479,20 +480,60 @@ class AudioEngine:
             return None
 
     def _scan_jack_ports(self) -> List[dict]:
-        """Scan for JACK audio ports."""
+        """Scan for JACK audio ports and associate them with devices."""
         ports = []
         try:
             # Check if JACK is running
             import subprocess
-            result = subprocess.run(["jack_lsp"], capture_output=True, text=True, timeout=5)
+            result = subprocess.run(["jack_lsp", "-p"], capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
+                current_device = None
+                current_port = None
+                port_properties = {}
+
                 for line in result.stdout.splitlines():
-                    if line.strip():
-                        ports.append({
-                            "name": line.strip(),
-                            "type": "audio"  # Default to audio for now
-                        })
-                log.info("Found %d JACK ports via jack_lsp", len(ports))
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    # Parse JACK port output
+                    if line.startswith("port:") or (":" in line and not line.startswith("properties:")):
+                        # Save previous port if exists
+                        if current_port:
+                            port_info = {"name": current_port, "device": current_device}
+                            port_info.update(port_properties)
+                            ports.append(port_info)
+
+                        # Parse new port
+                        parts = line.split(":")
+                        if len(parts) >= 2:
+                            device_name = parts[0]
+                            port_name = parts[1].strip()
+
+                            # Try to match with known devices
+                            current_device = self._find_device_by_jack_name(device_name)
+                            current_port = f"{device_name}:{port_name}"
+                            port_properties = {}
+
+                    elif line.startswith("properties:"):
+                        # Parse port properties
+                        props = line.replace("properties:", "").strip()
+                        if "input" in props.lower():
+                            port_properties["direction"] = "input"
+                        elif "output" in props.lower():
+                            port_properties["direction"] = "output"
+                        if "audio" in props.lower():
+                            port_properties["type"] = "audio"
+                        elif "midi" in props.lower():
+                            port_properties["type"] = "midi"
+
+                # Add last port
+                if current_port:
+                    port_info = {"name": current_port, "device": current_device}
+                    port_info.update(port_properties)
+                    ports.append(port_info)
+
+                log.info("Found %d JACK ports", len(ports))
             else:
                 log.info("JACK daemon not running or no ports available")
 
@@ -500,6 +541,13 @@ class AudioEngine:
             log.warning("Failed to scan JACK ports: %s", e)
 
         return ports
+
+    def _find_device_by_jack_name(self, jack_name: str) -> Optional[str]:
+        """Find device ID by JACK client name."""
+        for device_id, device in self._devices.items():
+            if device.jack_client_name == jack_name:
+                return device_id
+        return None
 
     async def connect_devices(self, source_device: str, dest_device: str,
                              channel_mapping: Dict = None) -> bool:
@@ -529,9 +577,13 @@ class AudioEngine:
                 enabled=True
             )
 
-            # TODO: Implement actual JACK connections
-            # For now, use jack_connect command-line tool
+            # Create JACK connections using discovered ports
+            if not channel_mapping:
+                # Auto-discover and connect ports
+                channel_mapping = self._auto_discover_port_mapping(source, dest)
+
             if channel_mapping:
+                connected_count = 0
                 for source_ch, dest_ch in channel_mapping.items():
                     source_port = f"{source.jack_client_name}:{source_ch}"
                     dest_port = f"{dest.jack_client_name}:{dest_ch}"
@@ -543,13 +595,20 @@ class AudioEngine:
                             ["jack_connect", source_port, dest_port],
                             capture_output=True, text=True, timeout=5
                         )
-                        if result.returncode != 0:
-                            log.warning("JACK connect failed: %s", result.stderr)
+                        if result.returncode == 0:
+                            connected_count += 1
+                            log.info("Connected JACK port: %s -> %s", source_port, dest_port)
+                        else:
+                            log.warning("JACK connect failed for %s -> %s: %s", source_port, dest_port, result.stderr)
                     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-                        log.warning("jack_connect command failed: %s", e)
+                        log.warning("jack_connect command failed for %s -> %s: %s", source_port, dest_port, e)
+
+                if connected_count > 0:
+                    log.info("Successfully connected %d channel(s)", connected_count)
+                else:
+                    log.warning("No channels were connected")
             else:
-                # Default: connect all available channels
-                log.info("Creating default audio connection: %s -> %s", source.name, dest.name)
+                log.warning("No port mapping found between devices")
 
             self._connections.append(connection)
             self.mark_dirty()
@@ -635,6 +694,50 @@ class AudioEngine:
         except Exception as e:
             log.error("Failed to remove audio connection: %s", e)
             return False
+
+    async def remove_connection(self, source_device: str, dest_device: str) -> bool:
+        """Remove audio connection (API compatibility method)."""
+        return await self.disconnect_devices(source_device, dest_device)
+
+    def _auto_discover_port_mapping(self, source: AudioDevice, dest: AudioDevice) -> Dict:
+        """Automatically discover port mapping between two devices.
+
+        Args:
+            source: Source audio device
+            dest: Destination audio device
+
+        Returns:
+            Dictionary mapping source channels to destination channels
+        """
+        mapping = {}
+
+        # Get source output ports and destination input ports
+        source_outputs = [p for p in self._jack_ports
+                         if p.get("device") == source.device_id and p.get("direction") == "output"]
+        dest_inputs = [p for p in self._jack_ports
+                       if p.get("device") == dest.device_id and p.get("direction") == "input"]
+
+        # Match ports by channel number (1:1, 2:2, etc.)
+        for source_port in source_outputs:
+            port_name = source_port["name"].split(":")[-1] if ":" in source_port["name"] else source_port["name"]
+            # Try to extract channel number from port name
+            if "out" in port_name.lower():
+                channel_num = port_name.split("_")[-1] if "_" in port_name else "1"
+                # Look for corresponding input port
+                for dest_port in dest_inputs:
+                    dest_name = dest_port["name"].split(":")[-1] if ":" in dest_port["name"] else dest_port["name"]
+                    if f"in_{channel_num}" in dest_name.lower() or f"input_{channel_num}" in dest_name.lower():
+                        mapping[f"out_{channel_num}"] = f"in_{channel_num}"
+                        break
+
+        # Fallback: simple stereo mapping
+        if not mapping and source_outputs and dest_inputs:
+            if len(source_outputs) >= 1 and len(dest_inputs) >= 1:
+                mapping["out_1"] = "in_1"
+            if len(source_outputs) >= 2 and len(dest_inputs) >= 2:
+                mapping["out_2"] = "in_2"
+
+        return mapping
 
     def _create_audio_device_from_alsa(self, alsa_device: dict) -> Optional[AudioDevice]:
         """Create AudioDevice from ALSA device information."""

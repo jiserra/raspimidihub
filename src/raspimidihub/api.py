@@ -2951,3 +2951,132 @@ def register_api(server: WebServer, engine, config: Config,
         engine.mark_dirty()
         await server.send_sse("plugin-changed", {"instance_id": instance_id})
         return Response.json({"status": "deleted"})
+
+    # ================================================================
+    # Audio routing endpoints (only available when operating_mode == "audio")
+    # ================================================================
+
+    @server.route("GET", "/api/audio/devices", summary="List audio devices and JACK ports")
+    async def api_audio_devices(req: Request) -> Response:
+        """List all discovered audio devices and their JACK ports."""
+        if config.operating_mode != "audio":
+            return Response.error("Audio routing only available in audio mode", 400)
+
+        if not hasattr(engine, 'devices'):
+            return Response.error("Audio engine not available", 503)
+
+        result = []
+        for device in engine.devices:
+            device_info = {
+                "device_id": device.device_id,
+                "name": device.name,
+                "jack_client_name": device.jack_client_name,
+                "usb_topology": device.usb_topology,
+                "serial": device.serial,
+                "has_capture": device.has_capture,
+                "has_playback": device.has_playback,
+                "channels": device.channels,
+                "ports": []  # Will be populated with JACK ports
+            }
+
+            # Get JACK ports for this device if available
+            if hasattr(engine, '_jack_ports'):
+                for port in engine._jack_ports:
+                    if port.get("device") == device.device_id:
+                        device_info["ports"].append({
+                            "name": port["name"],
+                            "direction": port.get("direction", "unknown"),
+                            "type": port.get("type", "audio")
+                        })
+
+            result.append(device_info)
+
+        return Response.json(result)
+
+    @server.route("GET", "/api/audio/connections", summary="List current audio connections")
+    async def api_audio_connections_get(req: Request) -> Response:
+        """Get all active audio routing connections."""
+        if config.operating_mode != "audio":
+            return Response.error("Audio routing only available in audio mode", 400)
+
+        if not hasattr(engine, 'connections'):
+            return Response.error("Audio engine not available", 503)
+
+        result = []
+        for i, conn in enumerate(engine.connections):
+            result.append({
+                "id": i,
+                "source_device": conn.source_device,
+                "dest_device": conn.dest_device,
+                "channel_mapping": conn.channel_mapping,
+                "enabled": conn.enabled,
+                "gain": conn.gain,
+                "muted": conn.muted,
+                "phase_invert": conn.phase_invert
+            })
+
+        return Response.json(result)
+
+    @server.route("POST", "/api/audio/connections", summary="Create audio connection")
+    async def api_audio_connections_post(req: Request) -> Response:
+        """Create a new audio routing connection between devices."""
+        if config.operating_mode != "audio":
+            return Response.error("Audio routing only available in audio mode", 400)
+
+        if not hasattr(engine, 'connect_devices'):
+            return Response.error("Audio engine not available", 503)
+
+        data = req.json
+        source_device = data.get("source_device")
+        dest_device = data.get("dest_device")
+        channel_mapping = data.get("channel_mapping", {})
+
+        if not source_device or not dest_device:
+            return Response.error("source_device and dest_device required")
+
+        try:
+            success = await engine.connect_devices(source_device, dest_device, channel_mapping)
+            if success:
+                config.set_audio_connections(engine.connections)
+                await config.asave()
+                engine.mark_dirty()
+                return Response.json({"status": "created"}, 201)
+            else:
+                return Response.error("Failed to create audio connection", 500)
+        except Exception as e:
+            return Response.error(f"Connection failed: {str(e)}", 500)
+
+    @server.route("DELETE", "/api/audio/connections/", exact=False, summary="Remove audio connection")
+    async def api_audio_connections_delete(req: Request) -> Response:
+        """Remove an audio connection by ID."""
+        if config.operating_mode != "audio":
+            return Response.error("Audio routing only available in audio mode", 400)
+
+        if not hasattr(engine, 'remove_connection'):
+            return Response.error("Audio engine not available", 503)
+
+        conn_id = req.path_param("/api/audio/connections/")
+        if not conn_id:
+            return Response.error("Connection ID required")
+
+        try:
+            conn_id = int(conn_id)
+            if conn_id < 0 or conn_id >= len(engine.connections):
+                return Response.error("Connection not found", 404)
+
+            connection = engine.connections[conn_id]
+            source_device = connection.source_device
+            dest_device = connection.dest_device
+
+            success = await engine.remove_connection(source_device, dest_device)
+            if success:
+                config.set_audio_connections(engine.connections)
+                await config.asave()
+                engine.mark_dirty()
+                return Response.json({"status": "deleted"})
+            else:
+                return Response.error("Failed to remove audio connection", 500)
+        except ValueError:
+            return Response.error("Invalid connection ID", 400)
+        except Exception as e:
+            return Response.error(f"Deletion failed: {str(e)}", 500)
