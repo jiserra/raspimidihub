@@ -384,8 +384,10 @@ async def async_main() -> None:
 
         # Load per-device clock-source veto from config. List of
         # stable_ids whose Clock / Start / Stop won't feed the bus.
-        engine.device_registry.load_clock_blocked(
-            config.data.get("device_clock_blocked", []))
+        # Only applicable to MIDI engine
+        if hasattr(engine, 'device_registry'):
+            engine.device_registry.load_clock_blocked(
+                config.data.get("device_clock_blocked", []))
 
         # Restore plugin instances from config BEFORE the initial scan so plugin
         # ALSA clients are visible when saved connections are applied.
@@ -395,7 +397,9 @@ async def async_main() -> None:
 
         # Initial device scan + apply saved config (connections, filters, mappings).
         # Runs here (not in engine.start) so plugins are already registered.
-        engine._scan_and_connect()
+        # Only applicable to MIDI engine
+        if hasattr(engine, '_scan_and_connect'):
+            engine._scan_and_connect()
 
         if not config_ok:
             led.set_fast_blink()
