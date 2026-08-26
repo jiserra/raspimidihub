@@ -98,6 +98,7 @@ sub-millisecond loop lag even on a busy unit.
 | **Python 3.11+** (stdlib only) | Routing service runtime |
 | **ALSA seq** (via `libasound2` + `ctypes`) | MIDI routing core |
 | **BlueZ** | Bluetooth stack; `midi` plugin disabled in favour of the in-tree bridge |
+| **JACK 2 + jack-example-tools** | Audio mode only: `jackd` binds one USB card as `system`; `alsa_in` / `alsa_out` bridge every other USB card into the graph (`AudioEngine`) |
 | **hostapd + dnsmasq** | WiFi access point |
 | **wpa_supplicant** | WiFi client mode |
 | **avahi-daemon** | mDNS (`raspimidihub-<id>.local`) |
@@ -166,6 +167,7 @@ Top-level keys of the exported / saved JSON:
 | `wifi` | object | WiFi configuration; see *WiFi Configuration* below. |
 | `network_midi` | object | Network MIDI (RTP-MIDI) sharing; see *Network MIDI Configuration* below. |
 | `midi2` | object | MIDI 2.0 behaviour: `force_midi1` (list of device stable-IDs to treat as MIDI 1.0 — escape hatch for misbehaving devices), `ci_enabled` (bool, default true — send MIDI-CI Capability Inquiry to bidirectional devices on connect), `ci_disabled` (list of stable-IDs to never probe). |
+| `operating_mode` / `mode_locked` / `audio_routing` | — | Audio mode: the chosen mode (`"midi"` or `"audio"`), an optional lock, and the audio connection list written by `AudioEngine` (source/dest device IDs, full JACK port-name mapping, per-connection gain/mute fields reserved for future use). Present once audio mode has been used; see chapter 2, *USB Audio Routing*. |
 
 Plugin instances, controller instances, device and port renames,
 and per-cell filter/mapping state live inside `connections` and its

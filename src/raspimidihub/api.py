@@ -362,6 +362,21 @@ def register_api(server: WebServer, engine, config: Config,
             _snapshot_into_config_impl()
 
     def _snapshot_into_config_impl() -> None:
+        # Mode-dependent snapshot. The MIDI path serialises the routing
+        # graph; the audio engine has none of those attributes and carries
+        # its own serializer. NOTE: `engine` here is the registration-time
+        # closure reference — always prefer the engine manager's live
+        # engine when present (dynamic mode switching swaps it).
+        em = getattr(server, '_engine_manager', None)
+        live_engine = em.get_engine() if em is not None else engine
+
+        if not hasattr(getattr(live_engine, "filter_engine", None),
+                       "filtered_connections"):
+            # Audio engine: persist via its own plain-dict serializer.
+            if hasattr(live_engine, "_save_audio_routing_config"):
+                live_engine._save_audio_routing_config(config.data)
+            return
+
         fe = engine.filter_engine
         registry = engine.device_registry
         config.set_connections(
@@ -770,6 +785,12 @@ def register_api(server: WebServer, engine, config: Config,
 
     @server.route("GET", "/api/devices", summary="List MIDI devices and ports (online plus saved-offline), with names, flags, and plugin/export info.")
     async def api_devices(req: Request) -> Response:
+        # MIDI-mode shape (client_id / stable_id / registry…). In audio
+        # mode there is no such graph — return empty rather than erroring
+        # off a stale engine reference every time an SSE event makes the
+        # header re-fetch.
+        if config.operating_mode != "midi":
+            return Response.json([])
         # Use the CACHED device list, not a fresh scan_devices() — a full
         # ALSA re-enumeration here is ~150 ms on a busy rig and the UI
         # fetches /api/devices on every connection-changed SSE, so a
@@ -1109,6 +1130,9 @@ def register_api(server: WebServer, engine, config: Config,
 
     @server.route("GET", "/api/connections", summary="List active and saved-offline routing connections, including filter/mapping state.")
     async def api_connections(req: Request) -> Response:
+        # MIDI-mode graph only — audio mode routes via /api/audio/*.
+        if config.operating_mode != "midi":
+            return Response.json([])
         conns = []
         fe = engine.filter_engine
         for c in sorted(engine.connections,
@@ -3058,9 +3082,14 @@ def register_api(server: WebServer, engine, config: Config,
                 current_engine._save_audio_routing_config(config.data)
                 await config.asave()
                 current_engine.mark_dirty()
+                # Fan out like the MIDI path does so other open tabs
+                # re-fetch and see the new edge.
+                await server.send_sse("connection-changed", {"action": "created"})
                 return Response.json({"status": "created"}, 201)
             else:
-                return Response.error("Failed to create audio connection", 500)
+                return Response.error(
+                    "No JACK wires could be connected for this pair "
+                    "(see hub log)", 500)
         except Exception as e:
             return Response.error(f"Connection failed: {str(e)}", 500)
 
@@ -3076,9 +3105,6 @@ def register_api(server: WebServer, engine, config: Config,
 
         current_engine = engine_manager.get_engine()
         if not hasattr(current_engine, 'remove_connection'):
-            return Response.error("Audio engine not available", 503)
-
-        if not hasattr(engine, 'remove_connection'):
             return Response.error("Audio engine not available", 503)
 
         conn_id = req.path_param("/api/audio/connections/")
@@ -3099,6 +3125,7 @@ def register_api(server: WebServer, engine, config: Config,
                 current_engine._save_audio_routing_config(config.data)
                 await config.asave()
                 current_engine.mark_dirty()
+                await server.send_sse("connection-changed", {"action": "deleted"})
                 return Response.json({"status": "deleted"})
             else:
                 return Response.error("Failed to remove audio connection", 500)

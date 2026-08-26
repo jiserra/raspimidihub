@@ -7,6 +7,7 @@ Connection Kit.
 
 import asyncio
 import logging
+import time
 from typing import Optional, Dict, List, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -122,6 +123,18 @@ class AudioEngine:
         self._hotplug_task = None
         self._last_device_state: Dict[str, bool] = {}
 
+        # Process ownership of the audio graph. jackd binds exactly ONE
+        # ALSA card (the playback-capable USB one, as "system:*"); every
+        # OTHER capture/playback-capable USB card is bridged into the
+        # graph with alsa_in / alsa_out under its own stable client name.
+        # We track the Popen handles we spawned so cleanup kills only
+        # what we own — and the hotplug watchdog can respawn on death.
+        self._jack_proc: Optional["object"] = None      # our jackd Popen (None if pre-existing)
+        self._bridge_procs: Dict[str, object] = {}       # jack client name -> Popen
+        self._jack_clients_by_card: Dict[int, str] = {}  # card_num -> jack client name
+        self._card_of_device: Dict[str, int] = {}        # device_id -> ALSA card num
+        self._jack_was_external = False                  # True if jackd was already running at start
+
     @property
     def devices(self) -> List[AudioDevice]:
         """List of discovered audio devices."""
@@ -210,126 +223,220 @@ class AudioEngine:
             log.info("AudioEngine event loop ended")
 
     def _initialize_jack(self):
-        """Initialize JACK client connection and start JACK server if needed."""
-        log.info("Initializing JACK client: %s", self._client_name)
+        """Bring up the JACK graph for ALL USB audio cards.
 
+        One jackd instance owns exactly one ALSA card — the first
+        playback-capable one we can find (it appears in the graph as the
+        "system" client). Every OTHER capture/playback-capable USB card is
+        bridged into the graph by a small alsa_in / alsa_out helper process
+        under a stable client name. Without the bridges only ONE of the two
+        USB gadgets would exist inside JACK and cross-device routing could
+        never physically connect.
+        """
+        import subprocess
+
+        log.info("Initializing JACK graph: %s", self._client_name)
         try:
-            # First, check if JACK daemon is already running
-            import subprocess
             try:
                 result = subprocess.run(["jack_lsp"], capture_output=True, timeout=2)
                 jack_running = result.returncode == 0
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 jack_running = False
+            self._jack_was_external = jack_running
+
+            alsa_devices = self._scan_alsa_devices()
 
             if not jack_running:
-                log.info("JACK daemon not running, starting JACK server")
-                self._start_jack_server()
+                owner_card = self._pick_owner_card(alsa_devices)
+                if owner_card is None:
+                    log.warning("No ALSA cards at all — no audio graph possible")
+                    return
+                self._start_jack_server(owner_card)
 
-            # TODO: Initialize JACK client when Python JACK bindings are available
-            # For now, we'll use command-line tools (jack_connect, jack_disconnect, etc.)
-            log.info("JACK ready for audio routing")
+            # Bridge every other USB card into the graph. When jackd was
+            # pre-existing we don't know which card it bound; conservatively
+            # bridge nothing then — single-owner-card routing still works.
+            if not jack_running:
+                self._bridge_secondary_cards(alsa_devices, owner_card)
+                if owner_card is not None:
+                    self._jack_clients_by_card[owner_card] = "system"
 
         except Exception as e:
-            log.error("Failed to initialize JACK: %s", e)
+            log.error("Failed to initialize JACK graph: %s", e)
             raise
 
-    def _start_jack_server(self, preferred_device: str = None):
-        """Start JACK server with appropriate parameters.
-
-        Args:
-            preferred_device: Optional ALSA device (e.g., "hw:3") to use
-        """
+    def _is_usb_card(self, card_num: int) -> bool:
+        """True when the ALSA card hangs off the USB bus."""
         try:
-            import subprocess
+            link = Path(f"/sys/class/sound/card{card_num}/device")
+            if link.is_symlink():
+                return "usb" in str(link.resolve()).lower()
+        except Exception:
+            pass
+        return False
 
-            # Find the best audio device to use for JACK
-            # Priority: USB audio interfaces > built-in audio
-            target_device = preferred_device or self._find_best_audio_device()
+    def _pick_owner_card(self, devices: List[dict]) -> Optional[int]:
+        """Choose which ALSA card jackd itself binds to.
 
-            if not target_device:
-                log.warning("No suitable audio device found, using hw:0")
-                target_device = "hw:0"
-            else:
-                log.info("Using audio device: %s", target_device)
+        Priority: USB + playback-capable first (it hosts system:playback_*,
+        what a destination gadget needs), then any playback-capable card,
+        then the first card of any kind.
+        """
+        usb_play = [d for d in devices
+                    if d.get("has_playback") and self._is_usb_card(d["card"])]
+        if usb_play:
+            return usb_play[0]["card"]
+        play = [d for d in devices if d.get("has_playback")]
+        if play:
+            return play[0]["card"]
+        return devices[0]["card"] if devices else None
 
-            # Start JACK daemon with standard parameters
-            cmd = [
-                "jackd", "-d", "alsa",
-                "-d", target_device,  # Use the best available device
-                "-r", "48000",        # Sample rate
-                "-p", "256",          # Larger buffer size for stability
-                "-n", "3",            # Periods
-                "--name", self._client_name
-            ]
+    @staticmethod
+    def _jack_safe_name(name: str) -> str:
+        """Sanitize an ALSA name into a valid JACK client name."""
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name.strip())
+        return safe[:24] or f"audio"
 
-            log.info("Starting JACK server: %s", " ".join(cmd))
+    def _start_jack_server(self, owner_card: int):
+        """Start jackd bound to `owner_card`. Stores our Popen so cleanup
+        kills only what we spawned — an externally-started jackd is left
+        alone entirely (_jack_was_external)."""
+        import subprocess
 
-            # Start JACK daemon in background
+        target_device = f"hw:{owner_card}"
+        cmd = [
+            "jackd",
+            "-d", "alsa",
+            "-d", target_device,
+            "-r", "48000",       # (alsa driver) sample rate
+            "-p", "256",
+            "-n", "3",
+            "--name", self._client_name,
+        ]
+        # No scheduling flag on purpose: jackd2 defaults to RT mode (-r is
+        # actually NO-realtime there). The appliance runs as root, so RT
+        # grants succeed.
+        # Also deliberately NOT -T: on jackd2 that marks a TEMPORARY
+        # server which exits once its last client disconnects — a bridge
+        # restart must never be able to kill the daemon.
+        log.info("Starting jackd: %s", " ".join(cmd))
+        try:
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                start_new_session=True  # Detach from parent process
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
-
-            # Wait a moment for JACK to start
-            import time
-            time.sleep(2)
-
-            # Check if JACK started successfully
-            if process.poll() is not None:
-                # Process has exited
-                stderr = process.stderr.read().decode() if process.stderr else ""
-                log.error("JACK daemon failed to start: %s", stderr)
-                # Don't raise an error - continue without JACK
-                log.warning("Continuing without JACK server - audio routing will use command-line tools")
-                return
-
-            log.info("JACK server started successfully (PID: %d)", process.pid)
-
         except FileNotFoundError:
-            log.warning("jackd not found - audio routing will use command-line tools")
-        except Exception as e:
-            log.warning("Failed to start JACK server: %s", e)
-            log.warning("Continuing without JACK server - audio routing will use command-line tools")
+            log.warning("jackd binary not found — audio routing unavailable")
+            return
 
-    def _find_best_audio_device(self) -> Optional[str]:
-        """Find the best audio device for JACK to use.
+        # jackd takes a moment to open the device before clients can attach.
+        for _ in range(20):                      # up to ~4 s
+            time.sleep(0.2)
+            if process.poll() is not None:
+                break
+            try:
+                probe = subprocess.run(["jack_lsp"], capture_output=True, timeout=1)
+                if probe.returncode == 0:
+                    self._jack_proc = process
+                    log.info("jackd started (PID %d) on %s", process.pid, target_device)
+                    return
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
 
-        Priority: USB audio interfaces > built-in audio
-        Returns ALSA device string like "hw:3"
-        """
-        try:
-            devices = self._scan_alsa_devices()
+        if process.poll() is not None:
+            log.error("jackd exited immediately (rc=%s) on %s "
+                      "(check: another process may own hw:%s)",
+                      process.returncode, target_device, owner_card)
+        else:
+            # Still alive but never answered jack_lsp — leave it running,
+            # it may just be slow; watchdog will reconcile later.
+            self._jack_proc = process
+            log.warning("jackd alive but did not answer jack_lsp within 4 s")
 
-            # Look for USB audio devices first
-            for device in devices:
-                device_name = device.get("name", "").lower()
-                # Check if it's a USB audio device
-                card_num = device.get("card")
-                card_path = Path(f"/sys/class/sound/card{card_num}")
+    def _apply_jack_client_names(self):
+        """Stamp the resolved JACK client names onto the live AudioDevice
+        objects using the device_id -> card map recorded at discovery.
+        Devices without a matching card get '' — they cannot be routed."""
+        for device_id, dev in self._devices.items():
+            card = self._card_of_device.get(device_id)
+            dev.jack_client_name = self._jack_clients_by_card.get(card, "")
 
-                if card_path.exists():
-                    # Check if it's a USB device
-                    device_link = card_path / "device"
-                    if device_link.is_symlink():
-                        target = device_link.resolve()
-                        # USB devices have "usb" in their path
-                        if "usb" in str(target).lower():
-                            log.info("Found USB audio device: %s (card %s)", device.get("name"), card_num)
-                            return f"hw:{card_num}"
+    def _bridge_secondary_cards(self, devices: List[dict], owner_card: int):
+        """Spawn alsa_in / alsa_out bridges so every OTHER USB card shows
+        up as its own JACK client. Requires jack-example-tools (Debian);
+        absence is logged once and bridged routing is then impossible."""
 
-            # Fallback to first available device
-            if devices:
-                card_num = devices[0].get("card")
-                log.info("Using first available device: card %s", card_num)
-                return f"hw:{card_num}"
+        missing = []
+        for dev in devices:
+            card = dev["card"]
+            if card == owner_card or not self._is_usb_card(card):
+                continue
+            base = self._jack_safe_name(dev.get("name", ""))
+            want_capture = bool(dev.get("has_capture"))
+            want_playback = bool(dev.get("has_playback"))
 
-        except Exception as e:
-            log.warning("Failed to find best audio device: %s", e)
+            tool = None
+            args = []
+            role = ""
+            if want_capture:
+                tool, role = "alsa_in", "capture"
+                args = ["alsa_in", "-j", base, "-d", f"hw:{card}",
+                        "-r", "48000", "-c", "2", "-n", "2", "-q", "1"]
+            elif want_playback:
+                tool, role = "alsa_out", "playback"
+                args = ["alsa_out", "-j", base, "-d", f"hw:{card}",
+                        "-r", "48000", "-c", "2", "-n", "2", "-q", "1"]
+            if tool is None:
+                continue
 
-        return None
+            import shutil
+            path = shutil.which(tool)
+            if path is None:
+                if tool not in missing:
+                    missing.append(tool)
+                continue
+
+            import subprocess
+            try:
+                proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL,
+                                        start_new_session=True)
+            except OSError as e:
+                log.warning("Failed to spawn %s for card %d: %s", tool, card, e)
+                continue
+
+            time.sleep(0.5)  # let the bridge register with jackd
+            if proc.poll() is not None:
+                log.warning("%s for card %d died immediately (rc=%s) "
+                            "(missing jack-example-tools? bad rate?)",
+                            tool, card, proc.returncode)
+                continue
+
+            self._bridge_procs[base] = proc
+            self._jack_clients_by_card[card] = base
+            log.info("Bridged card %d (%s) via %s as client '%s'",
+                     card, dev.get("name"), role, base)
+
+        if missing:
+            log.warning("%s not found — install jack-example-tools to route "
+                        "through cards other than the jackd host", missing[0])
+
+    def _assign_jack_clients(self, devices: List[dict],
+                             owner_card: Optional[int]):
+        """Map each discovered AudioDevice to the JACK client name that
+        carries it. Owner card == 'system'; bridged cards carry the name
+        passed to alsa_in/alsa_out."""
+        if owner_card is not None:
+            self._jack_clients_by_card[owner_card] = "system"
+        for dev in devices:
+            card = dev["card"]
+            if card in self._jack_clients_by_card:
+                continue
+        # device_id -> card bookkeeping + final name assignment happens over
+        # the created AudioDevice objects (see _discover_audio_devices).
+
 
     def _discover_audio_devices(self):
         """Discover audio devices via ALSA and JACK.
@@ -344,17 +451,30 @@ class AudioEngine:
             alsa_devices = self._scan_alsa_devices()
             log.info("Found %d ALSA audio devices", len(alsa_devices))
 
-            # Discover JACK ports (always scan, even if JACK client not active)
-            self._jack_ports = self._scan_jack_ports()
-            log.info("Found %d JACK ports", len(self._jack_ports))
-
             # Create AudioDevice objects from discovered hardware
+            seen_ids = set()
             for alsa_device in alsa_devices:
                 device = self._create_audio_device_from_alsa(alsa_device)
                 if device:
                     self._devices[device.device_id] = device
-                    log.info("Registered audio device: %s (%s)", device.name, device.device_id)
-                    log.info("Registered audio device: %s (%s)", device.name, device.device_id)
+                    seen_ids.add(device.device_id)
+                    # Remember which ALSA card backs this device so
+                    # _apply_jack_client_names can stamp the right JACK client.
+                    self._card_of_device[device.device_id] = alsa_device["card"]
+                    log.info("Registered audio device: %s (%s)",
+                             device.name, device.device_id)
+
+            # Drop stale bookkeeping for vanished ids (hotplug rescan)
+            for gone in set(self._card_of_device) - seen_ids:
+                del self._card_of_device[gone]
+
+            # Stamp resolved JACK client names onto each device BEFORE the
+            # port scan — port->device association matches by client name.
+            self._apply_jack_client_names()
+
+            # Discover JACK ports last: needs named devices to associate.
+            self._jack_ports = self._scan_jack_ports()
+            log.info("Found %d JACK ports", len(self._jack_ports))
 
             # Notify callbacks
             self._notify_device_connected()
@@ -561,64 +681,79 @@ class AudioEngine:
         Args:
             source_device: Source device ID
             dest_device: Destination device ID
-            channel_mapping: Optional channel mapping {"out:1": "in:1", ...}
+            channel_mapping: Optional explicit mapping of FULL JACK port
+                names {"system:playback_1": "<src>:capture_1", ...}.
+                When omitted, ports are auto-discovered by position.
 
         Returns:
-            True if connection successful, False otherwise
+            True only when at least one JACK wire was actually connected —
+            a silent graph is never reported as success.
         """
+        import subprocess
+
         if source_device not in self._devices or dest_device not in self._devices:
-            log.error("Unknown device in connection request")
+            log.error("Unknown device in connection request (%s -> %s)",
+                      source_device, dest_device)
             return False
 
         source = self._devices[source_device]
         dest = self._devices[dest_device]
 
         try:
-            # Create AudioConnection object
+            # Resolve which real JACK ports carry this edge.
+            if channel_mapping:
+                port_map = dict(channel_mapping)
+            elif not source.jack_client_name or not dest.jack_client_name:
+                log.warning("Cannot route %s -> %s: no JACK client bound "
+                            "(missing bridge? card unowned?)",
+                            source.name, dest.name)
+                return False
+            else:
+                port_map = self._auto_discover_port_mapping(source, dest)
+
+            if not port_map:
+                log.warning("No routable JACK ports found for %s -> %s "
+                            "(source outputs=%d dest inputs=%d; seen %d jack ports)",
+                            source.name, dest.name, len(source.outputs),
+                            len(dest.inputs), len(self._jack_ports))
+                return False
+
+            connected_pairs = {}
+            for src_port, dst_port in port_map.items():
+                try:
+                    result = subprocess.run(
+                        ["jack_connect", src_port, dst_port],
+                        capture_output=True, text=True, timeout=5
+                    )
+                except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                    log.warning("jack_connect failed for %s -> %s: %s",
+                                src_port, dst_port, e)
+                    continue
+                if result.returncode == 0:
+                    connected_pairs[src_port] = dst_port
+                    log.info("JACK wired: %s -> %s", src_port, dst_port)
+                else:
+                    stderr = (result.stderr or "").strip()
+                    log.warning("jack_connect refused %s -> %s: %s",
+                                src_port, dst_port, stderr)
+
+            if not connected_pairs:
+                log.error("Audio connection failed: 0/%d wires connected "
+                          "for %s -> %s", len(port_map), source.name, dest.name)
+                return False
+
             connection = AudioConnection(
                 source_device=source_device,
                 dest_device=dest_device,
-                channel_mapping=channel_mapping or {},
+                channel_mapping=connected_pairs,
                 enabled=True
             )
-
-            # Create JACK connections using discovered ports
-            if not channel_mapping:
-                # Auto-discover and connect ports
-                channel_mapping = self._auto_discover_port_mapping(source, dest)
-
-            if channel_mapping:
-                connected_count = 0
-                for source_ch, dest_ch in channel_mapping.items():
-                    source_port = f"{source.jack_client_name}:{source_ch}"
-                    dest_port = f"{dest.jack_client_name}:{dest_ch}"
-
-                    # Try to connect via jack_connect
-                    try:
-                        import subprocess
-                        result = subprocess.run(
-                            ["jack_connect", source_port, dest_port],
-                            capture_output=True, text=True, timeout=5
-                        )
-                        if result.returncode == 0:
-                            connected_count += 1
-                            log.info("Connected JACK port: %s -> %s", source_port, dest_port)
-                        else:
-                            log.warning("JACK connect failed for %s -> %s: %s", source_port, dest_port, result.stderr)
-                    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-                        log.warning("jack_connect command failed for %s -> %s: %s", source_port, dest_port, e)
-
-                if connected_count > 0:
-                    log.info("Successfully connected %d channel(s)", connected_count)
-                else:
-                    log.warning("No channels were connected")
-            else:
-                log.warning("No port mapping found between devices")
-
             self._connections.append(connection)
             self.mark_dirty()
 
-            log.info("Audio connection created: %s -> %s", source.name, dest.name)
+            log.info("Audio connection created: %s -> %s (%d channel%s)",
+                     source.name, dest.name, len(connected_pairs),
+                     "s" if len(connected_pairs) != 1 else "")
 
             # Notify callbacks
             for callback in self._on_change_callbacks:
@@ -655,31 +790,41 @@ class AudioEngine:
                     break
 
             if connection:
-                # TODO: Implement actual JACK disconnections
-                # For now, use jack_disconnect command-line tool
-                source = self._devices[source_device]
-                dest = self._devices[dest_device]
+                import subprocess
+                source = self._devices.get(source_device)
+                dest = self._devices.get(dest_device)
 
-                if connection.channel_mapping:
-                    for source_ch, dest_ch in connection.channel_mapping.items():
-                        source_port = f"{source.jack_client_name}:{source_ch}"
-                        dest_port = f"{dest.jack_client_name}:{dest_ch}"
+                # Stored channel_mapping holds FULL jack port names
+                # ({src_full: dst_full}). Legacy entries written by the old
+                # name-synthesis code ("out_1") can't be trusted; rediscover.
+                port_map = None
+                if connection.channel_mapping and all(
+                        ":" in k and ":" in v
+                        for k, v in connection.channel_mapping.items()):
+                    port_map = connection.channel_mapping
+                elif source and dest and source.jack_client_name and dest.jack_client_name:
+                    port_map = self._auto_discover_port_mapping(source, dest)
 
+                if port_map:
+                    for src_port, dst_port in port_map.items():
                         try:
-                            import subprocess
                             result = subprocess.run(
-                                ["jack_disconnect", source_port, dest_port],
+                                ["jack_disconnect", src_port, dst_port],
                                 capture_output=True, text=True, timeout=5
                             )
                             if result.returncode != 0:
-                                log.warning("JACK disconnect failed: %s", result.stderr)
+                                log.warning("JACK disconnect failed %s -x- %s: %s",
+                                            src_port, dst_port,
+                                            (result.stderr or "").strip())
                         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
                             log.warning("jack_disconnect command failed: %s", e)
 
                 self._connections.remove(connection)
                 self.mark_dirty()
 
-                log.info("Audio connection removed: %s -> %s", source.name, dest.name)
+                src_name = source.name if source else source_device
+                dst_name = dest.name if dest else dest_device
+                log.info("Audio connection removed: %s -> %s", src_name, dst_name)
 
                 # Notify callbacks
                 for callback in self._on_change_callbacks:
@@ -705,43 +850,31 @@ class AudioEngine:
         return await self.disconnect_devices(source_device, dest_device)
 
     def _auto_discover_port_mapping(self, source: AudioDevice, dest: AudioDevice) -> Dict:
-        """Automatically discover port mapping between two devices.
+        """Pair the source device's JACK output ports with the destination's
+        input ports positionally (1->1, 2->2 ...), using REAL ports observed
+        from jack_lsp — never synthesised names.
 
-        Args:
-            source: Source audio device
-            dest: Destination audio device
-
-        Returns:
-            Dictionary mapping source channels to destination channels
+        Returns a dict of FULL port names {src_full_name: dst_full_name},
+        sized to whichever side has fewer ports.
         """
+        src_client = source.jack_client_name
+        dst_client = dest.jack_client_name
+        if not src_client or not dst_client:
+            return {}
+
+        source_outputs = sorted(
+            p["name"] for p in self._jack_ports
+            if p.get("direction") == "output"
+            and p["name"].split(":", 1)[0] == src_client)
+        dest_inputs = sorted(
+            p["name"] for p in self._jack_ports
+            if p.get("direction") == "input"
+            and p["name"].split(":", 1)[0] == dst_client)
+
+        n = min(len(source_outputs), len(dest_inputs))
         mapping = {}
-
-        # Get source output ports and destination input ports
-        source_outputs = [p for p in self._jack_ports
-                         if p.get("device") == source.device_id and p.get("direction") == "output"]
-        dest_inputs = [p for p in self._jack_ports
-                       if p.get("device") == dest.device_id and p.get("direction") == "input"]
-
-        # Match ports by channel number (1:1, 2:2, etc.)
-        for source_port in source_outputs:
-            port_name = source_port["name"].split(":")[-1] if ":" in source_port["name"] else source_port["name"]
-            # Try to extract channel number from port name
-            if "out" in port_name.lower():
-                channel_num = port_name.split("_")[-1] if "_" in port_name else "1"
-                # Look for corresponding input port
-                for dest_port in dest_inputs:
-                    dest_name = dest_port["name"].split(":")[-1] if ":" in dest_port["name"] else dest_port["name"]
-                    if f"in_{channel_num}" in dest_name.lower() or f"input_{channel_num}" in dest_name.lower():
-                        mapping[f"out_{channel_num}"] = f"in_{channel_num}"
-                        break
-
-        # Fallback: simple stereo mapping
-        if not mapping and source_outputs and dest_inputs:
-            if len(source_outputs) >= 1 and len(dest_inputs) >= 1:
-                mapping["out_1"] = "in_1"
-            if len(source_outputs) >= 2 and len(dest_inputs) >= 2:
-                mapping["out_2"] = "in_2"
-
+        for i in range(n):
+            mapping[source_outputs[i]] = dest_inputs[i]
         return mapping
 
     def _create_audio_device_from_alsa(self, alsa_device: dict) -> Optional[AudioDevice]:
@@ -798,21 +931,6 @@ class AudioEngine:
         for i in range(count):
             ports.append(f"{direction}_{i+1}")
         return ports
-
-    def _generate_stable_device_id(self, card_num: int, device_name: str, alsa_device: dict) -> str:
-        """Generate stable device ID from card number, name, and USB info."""
-        # Try to get USB serial number for truly stable ID
-        serial = alsa_device.get("serial", "")
-        if serial:
-            return f"audio-{device_name.lower()}-{serial}"
-
-        # Try to use USB topology as fallback
-        usb_port = alsa_device.get("usb_port", "")
-        if usb_port:
-            return f"audio-{device_name.lower()}-usb{usb_port}"
-
-        # Fallback: use card number and name (may change across reconnects)
-        return f"audio-card{card_num}-{device_name.lower()}"
 
     def _generate_stable_device_id(self, card_num: int, device_name: str, alsa_device: dict = None) -> str:
         """Generate stable device ID from card number and name.
@@ -980,19 +1098,48 @@ class AudioEngine:
                 log.warning("Device connected callback failed: %s", e)
 
     def _cleanup(self):
-        """Clean up JACK client and resources."""
+        """Tear down the audio graph. Kills ONLY the helper processes this
+        engine spawned (bridges first, then our jackd) — an externally
+        started jackd is left untouched so we never yank someone else's rig.
+        Clearing device state here also means a later start() rediscovers.
+        """
+        import subprocess
+
         log.info("Cleaning up AudioEngine resources")
 
-        # Stop JACK daemon
-        try:
-            import subprocess
-            # Try to gracefully stop JACK
-            subprocess.run(["jack_kill", "-9"], capture_output=True, timeout=5)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass  # JACK may not be running or jack_kill not available
+        for name, proc in list(self._bridge_procs.items()):
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                log.info("Stopped bridge %s", name)
+            except Exception as e:
+                log.warning("Failed to stop bridge %s: %s", name, e)
+        self._bridge_procs.clear()
+
+        if self._jack_proc is not None:
+            try:
+                if self._jack_proc.poll() is None:
+                    self._jack_proc.terminate()
+                    try:
+                        self._jack_proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self._jack_proc.kill()
+                log.info("Stopped our jackd (PID %d)", self._jack_proc.pid)
+            except Exception as e:
+                log.warning("Failed to stop our jackd: %s", e)
+            finally:
+                self._jack_proc = None
+        else:
+            log.info("jackd was not ours — left running")
 
         # Clear device and connection state
         self._devices.clear()
+        self._card_of_device.clear()
+        self._jack_clients_by_card.clear()
         self._connections.clear()
 
     def _start_hotplug_monitoring(self):
@@ -1012,6 +1159,20 @@ class AudioEngine:
 
         while self._running:
             try:
+                # Graph health first: if OUR jackd or a bridge died (e.g.
+                # the USB card it held was unplugged), rebuild the whole
+                # graph and re-wire saved connections. (_jack_proc is only
+                # set when we spawned jackd ourselves; an external daemon
+                # is nobody's business here.)
+                if self._jack_proc is not None and self._jack_proc.poll() is not None:
+                    log.warning("Our jackd exited (rc=%s)", self._jack_proc.returncode)
+                    await self._rebuild_audio_graph()
+                    continue
+                if any(p.poll() is not None for p in self._bridge_procs.values()):
+                    log.warning("A JACK bridge died — rebuilding audio graph")
+                    await self._rebuild_audio_graph()
+                    continue
+
                 # Check if devices have changed
                 current_state = self._get_current_device_state()
 
@@ -1038,6 +1199,22 @@ class AudioEngine:
             except Exception as e:
                 log.warning("Error in hot-plug monitoring: %s", e)
                 await asyncio.sleep(5)  # Wait longer on error
+
+    async def _rebuild_audio_graph(self):
+        """Full graph rebuild after our jackd or a bridge died (usually
+        because its USB card was yanked). Runs blocking work inline — this
+        is a rare recovery path, not a steady-state cost."""
+        log.warning("Rebuilding audio graph")
+        self._bridge_procs.clear()
+        self._jack_proc = None
+        try:
+            await asyncio.sleep(1.0)   # let the kernel settle the USB removal
+            self._initialize_jack()
+            self._discover_audio_devices()
+            self._restore_saved_connections()
+            log.info("Audio graph rebuilt with %d device(s)", len(self._devices))
+        except Exception:
+            log.exception("Audio graph rebuild failed")
 
     def _get_current_device_state(self) -> Dict[str, bool]:
         """Get current state of audio devices."""
@@ -1213,7 +1390,14 @@ class AudioEngine:
             log.error("Failed to scan and connect: %s", e)
 
     def _restore_saved_connections(self):
-        """Restore saved audio connections."""
+        """Restore saved audio connections.
+
+        Saved channel_mapping values are a hint only — port numbering can
+        shift between boots (card order, bridge restarts), so each edge
+        re-runs positional auto-discovery against the ports jackd reports
+        RIGHT NOW and reconnects whatever matches.
+        """
+        import subprocess
         if not self._connections:
             return
 
@@ -1222,27 +1406,24 @@ class AudioEngine:
 
         for connection in self._connections:
             if connection.source_device in self._devices and connection.dest_device in self._devices:
+                source = self._devices[connection.source_device]
+                dest = self._devices[connection.dest_device]
                 try:
-                    # Re-establish JACK connections for saved connection
-                    source = self._devices[connection.source_device]
-                    dest = self._devices[connection.dest_device]
+                    port_map = self._auto_discover_port_mapping(source, dest)
+                    for src_port, dst_port in port_map.items():
+                        try:
+                            result = subprocess.run(
+                                ["jack_connect", src_port, dst_port],
+                                capture_output=True, text=True, timeout=5
+                            )
+                            if result.returncode == 0:
+                                restored_count += 1
+                        except (FileNotFoundError, subprocess.TimeoutExpired):
+                            pass  # device may still be settling at boot
 
-                    if connection.channel_mapping:
-                        for source_ch, dest_ch in connection.channel_mapping.items():
-                            source_port = f"{source.jack_client_name}:{source_ch}"
-                            dest_port = f"{dest.jack_client_name}:{dest_ch}"
-
-                            try:
-                                import subprocess
-                                result = subprocess.run(
-                                    ["jack_connect", source_port, dest_port],
-                                    capture_output=True, text=True, timeout=5
-                                )
-                                if result.returncode == 0:
-                                    restored_count += 1
-                            except (FileNotFoundError, subprocess.TimeoutExpired):
-                                pass  # May fail if device not yet available
-
+                    # Cache the live port names so delete works without a rescan.
+                    if port_map:
+                        connection.channel_mapping = dict(port_map)
                     connection.enabled = True
 
                 except Exception as e:

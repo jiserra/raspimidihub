@@ -39,6 +39,11 @@ The bottom navigation has up to four tabs:
 happens there, via the **Save / Load / Export / Import Config**
 buttons at the bottom of the matrix (chapter 5.10 and chapter 11).
 
+The Routing tab's content depends on the operating mode: in **audio
+mode** it shows the audio-routing page instead of the MIDI matrix
+(chapter 2, *USB Audio Routing*). Modes are switched from Settings →
+System and never mix -- a hub does MIDI *or* audio, not both at once.
+
 ## URL Routing
 
 Every tab has a path, the open device-detail panel is a path, and the

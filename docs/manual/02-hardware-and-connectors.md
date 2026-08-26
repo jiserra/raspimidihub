@@ -95,10 +95,41 @@ Bluetooth shares -- the fix for the coexistence trouble above. One
 radio serves both AP and client mode (chapter 13.1), which is why
 **WiFi for updates** briefly drops the AP.
 
-## Audio Output
+## USB Audio Routing (Audio Mode)
 
-Not used -- the appliance is MIDI-only. USB audio interfaces are
-recognised for their MIDI ports only.
+Since v6 the hub can also route **audio**: plug two USB-audio gadgets
+(for example a Dirtywave M8 and a Teenage Engineering EP series unit)
+into the Pi and pipe one's output into the other's input, with the Pi
+acting as the cable.
+
+Modes are strictly mutually exclusive -- a hub routes either MIDI or
+audio, never both at once. Switch with **Settings → System → Operating
+mode** (**MIDI / AUDIO**); the change applies immediately without a
+reboot. In audio mode the **Routing** tab shows an *Audio routing*
+page instead of the MIDI matrix.
+
+How the graph works, and what to expect:
+
+- Every USB audio card is discovered via ALSA and shown under
+  **Devices** with its channel counts. The hub starts a JACK daemon
+  bound to the first playback-capable USB card (it appears as the
+  `system` client); every *other* USB card is bridged into the graph
+  automatically (`alsa_in` / `alsa_out` from the `jack-example-tools`
+  package) under a stable client name derived from the card name.
+- A connection pairs the source's output channels with the
+  destination's input channels positionally (1→1, 2→2 …). Create it
+  from **New connection**, remove it again from the row's Delete
+  button. Connections are saved with the config, restored on boot,
+  and re-wired automatically when the devices are re-plugged; if the
+  whole audio graph dies (e.g. the card the daemon held was pulled),
+  the hub rebuilds it by itself within seconds.
+- Levels are straight-through for now: a connection's gain / mute /
+  phase settings are remembered but not yet applied.
+
+Built-in Pi audio (HDMI, headphone jack) deliberately takes no part
+in the audio graph -- only cards hanging off the USB ports are routed.
+JACK runs only while the hub is in audio mode; switching back to MIDI
+stops it and releases the soundcards.
 
 ## On-Board LEDs
 

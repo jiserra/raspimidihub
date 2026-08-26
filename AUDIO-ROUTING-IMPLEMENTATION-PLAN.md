@@ -82,7 +82,7 @@
 - ✅ Implemented `_save_audio_routing_config()` method
 - ✅ Added `_scan_and_connect()` for MidiEngine compatibility
 - ✅ Implemented saved connection restoration on startup
-- [ ] Full integration with autosave system
+- [x] Full integration with autosave system (audio edits persist via immediate config.asave(); no debounced tier needed)
 
 #### 📋 Phase 2.6: JACK Server Management (Complete)
 - ✅ Implemented JACK server startup with appropriate parameters
@@ -99,20 +99,20 @@
 - Configuration persistence and restoration
 - Compatibility layer with existing MidiEngine interface
 
-#### 📋 Phase 2.3: JACK Port Management (Pending)
-- [ ] Implement JACK port enumeration
-- [ ] Add connection management logic
-- [ ] Implement connection state tracking
+#### 📋 Phase 2.3: JACK Port Management (Complete)
+- [x] Implement JACK port enumeration (`jack_lsp -p`, parsed with direction/type)
+- [x] Add connection management logic (real port names; honest failure on 0 wires)
+- [x] Implement connection state tracking
 
-#### 📋 Phase 2.4: Hot-Plug Detection (Pending)
-- [ ] Implement inotify monitoring for audio devices
-- [ ] Add device state update handling
-- [ ] Integrate with SSE event system
+#### 📋 Phase 2.4: Hot-Plug Detection (Complete — poll watchdog, not inotify)
+- [ ] ~~Implement inotify monitoring for audio devices~~ superseded: 2 s /proc/asound poll + jackd/bridge liveness in the same loop rebuilds the graph and re-wires saved connections
+- [x] Add device state update handling (add/remove cards, stale-device cleanup)
+- [x] Integrate with SSE event system (`connection-changed` on create/delete)
 
-#### 📋 Phase 2.5: Routing Persistence (Pending)
-- [ ] Extend config.json schema for audio routing
-- [ ] Implement routing restoration on startup
-- [ ] Integrate with autosave system
+#### 📋 Phase 2.5: Routing Persistence (Complete)
+- [x] Extend config.json schema for audio routing (`audio_routing.connections` + `.devices`)
+- [x] Implement routing restoration on startup (`_scan_and_connect` re-runs positional auto-discovery against live ports)
+- [x] Integrate with autosave system (per-edit asave + snapshot path is mode-aware, Save/flush work in audio mode)
 
 ### Pending Phases
 
