@@ -2962,11 +2962,17 @@ def register_api(server: WebServer, engine, config: Config,
         if config.operating_mode != "audio":
             return Response.error("Audio routing only available in audio mode", 400)
 
-        if not hasattr(engine, 'devices'):
+        # Get current engine from engine_manager
+        engine_manager = getattr(server, '_engine_manager', None)
+        if not engine_manager:
+            return Response.error("Engine manager not available", 503)
+
+        current_engine = engine_manager.get_engine()
+        if not hasattr(current_engine, 'devices'):
             return Response.error("Audio engine not available", 503)
 
         result = []
-        for device in engine.devices:
+        for device in current_engine.devices:
             device_info = {
                 "device_id": device.device_id,
                 "name": device.name,
@@ -2980,8 +2986,8 @@ def register_api(server: WebServer, engine, config: Config,
             }
 
             # Get JACK ports for this device if available
-            if hasattr(engine, '_jack_ports'):
-                for port in engine._jack_ports:
+            if hasattr(current_engine, '_jack_ports'):
+                for port in current_engine._jack_ports:
                     if port.get("device") == device.device_id:
                         device_info["ports"].append({
                             "name": port["name"],
@@ -2999,11 +3005,16 @@ def register_api(server: WebServer, engine, config: Config,
         if config.operating_mode != "audio":
             return Response.error("Audio routing only available in audio mode", 400)
 
-        if not hasattr(engine, 'connections'):
+        engine_manager = getattr(server, '_engine_manager', None)
+        if not engine_manager:
+            return Response.error("Engine manager not available", 503)
+
+        current_engine = engine_manager.get_engine()
+        if not hasattr(current_engine, 'connections'):
             return Response.error("Audio engine not available", 503)
 
         result = []
-        for i, conn in enumerate(engine.connections):
+        for i, conn in enumerate(current_engine.connections):
             result.append({
                 "id": i,
                 "source_device": conn.source_device,
@@ -3023,7 +3034,12 @@ def register_api(server: WebServer, engine, config: Config,
         if config.operating_mode != "audio":
             return Response.error("Audio routing only available in audio mode", 400)
 
-        if not hasattr(engine, 'connect_devices'):
+        engine_manager = getattr(server, '_engine_manager', None)
+        if not engine_manager:
+            return Response.error("Engine manager not available", 503)
+
+        current_engine = engine_manager.get_engine()
+        if not hasattr(current_engine, 'connect_devices'):
             return Response.error("Audio engine not available", 503)
 
         data = req.json
@@ -3035,11 +3051,11 @@ def register_api(server: WebServer, engine, config: Config,
             return Response.error("source_device and dest_device required")
 
         try:
-            success = await engine.connect_devices(source_device, dest_device, channel_mapping)
+            success = await current_engine.connect_devices(source_device, dest_device, channel_mapping)
             if success:
-                config.set_audio_connections(engine.connections)
+                config.set_audio_connections(current_engine.connections)
                 await config.asave()
-                engine.mark_dirty()
+                current_engine.mark_dirty()
                 return Response.json({"status": "created"}, 201)
             else:
                 return Response.error("Failed to create audio connection", 500)
@@ -3052,6 +3068,14 @@ def register_api(server: WebServer, engine, config: Config,
         if config.operating_mode != "audio":
             return Response.error("Audio routing only available in audio mode", 400)
 
+        engine_manager = getattr(server, '_engine_manager', None)
+        if not engine_manager:
+            return Response.error("Engine manager not available", 503)
+
+        current_engine = engine_manager.get_engine()
+        if not hasattr(current_engine, 'remove_connection'):
+            return Response.error("Audio engine not available", 503)
+
         if not hasattr(engine, 'remove_connection'):
             return Response.error("Audio engine not available", 503)
 
@@ -3061,18 +3085,18 @@ def register_api(server: WebServer, engine, config: Config,
 
         try:
             conn_id = int(conn_id)
-            if conn_id < 0 or conn_id >= len(engine.connections):
+            if conn_id < 0 or conn_id >= len(current_engine.connections):
                 return Response.error("Connection not found", 404)
 
-            connection = engine.connections[conn_id]
+            connection = current_engine.connections[conn_id]
             source_device = connection.source_device
             dest_device = connection.dest_device
 
-            success = await engine.remove_connection(source_device, dest_device)
+            success = await current_engine.remove_connection(source_device, dest_device)
             if success:
-                config.set_audio_connections(engine.connections)
+                config.set_audio_connections(current_engine.connections)
                 await config.asave()
-                engine.mark_dirty()
+                current_engine.mark_dirty()
                 return Response.json({"status": "deleted"})
             else:
                 return Response.error("Failed to remove audio connection", 500)
