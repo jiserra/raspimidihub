@@ -116,13 +116,21 @@ How the graph works, and what to expect:
   `system` client); every *other* USB card is bridged into the graph
   automatically (`alsa_in` / `alsa_out` from the `jack-example-tools`
   package) under a stable client name derived from the card name.
-- A connection pairs the source's output channels with the
-  destination's input channels positionally (1→1, 2→2 …). Create it
-  from **New connection**, remove it again from the row's Delete
-  button. Connections are saved with the config, restored on boot,
-  and re-wired automatically when the devices are re-plugged; if the
-  whole audio graph dies (e.g. the card the daemon held was pulled),
-  the hub rebuilds it by itself within seconds.
+- A connection pairs source output channels with destination input
+  channels. Once you pick a source and a destination, both sides offer
+  a channel checklist of their live JACK ports (labelled *Ch N*); tick
+  what you want and they are paired in the order shown (first-ticked →
+  first-ticked), so ticking only Ch 1 and Ch 3 wires exactly those two.
+  Leave everything unticked and the default is all channels positionally
+  (1→1, 2→2 …); if one side has fewer channels than the other, the
+  extras are left unwired. Create it from **New connection**, remove
+  it again from the row's Delete button. Connections are saved with
+  the config, restored on boot, and re-wired automatically when the
+  devices are re-plugged; note that restore re-pairs by position, so a
+  reordered selection is re-wired as first-to-first against what is
+  online at that moment. If the whole audio graph dies (e.g. the card
+  the daemon held was pulled), the hub rebuilds it by itself within
+  seconds.
 - Levels are straight-through for now: a connection's gain / mute /
   phase settings are remembered but not yet applied.
 

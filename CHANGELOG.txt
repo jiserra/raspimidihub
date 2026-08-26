@@ -12,7 +12,10 @@ Unreleased
   output into another's through the Pi. jackd binds one USB card as the
   graph owner, every other USB card is bridged in automatically;
   connections persist and re-wire across reboots, replugs and audio-
-  graph crashes. Per-connection gain/mute are stored but not applied yet.
+  graph crashes. Each connection can pick exactly which output channels
+  of the source feed which input channels of the destination (live
+  channel checklists on both sides; all channels positionally by
+  default). Per-connection gain/mute are stored but not applied yet.
 
 
 2026-08-10 — Version 6.0.0a4
