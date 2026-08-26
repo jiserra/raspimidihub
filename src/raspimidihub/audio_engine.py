@@ -135,7 +135,8 @@ class AudioEngine:
         self._bridge_procs: Dict[str, object] = {}       # jack client name -> Popen
         self._jack_errfile = None                        # jackd stderr (read on death for diagnosis)
         self._bridge_errfiles: Dict[str, object] = {}    # bridge client name -> stderr file
-        self._next_graph_retry = 0.0                     # monotonic time of next bring-up retry        self._jack_clients_by_card: Dict[int, str] = {}  # card_num -> jack client name
+        self._next_graph_retry = 0.0                     # monotonic time of next bring-up retry
+        self._jack_clients_by_card: Dict[int, str] = {}  # card_num -> jack client name
         self._card_of_device: Dict[str, int] = {}        # device_id -> ALSA card num
         self._jack_was_external = False                  # True if jackd was already running at start
 
@@ -355,8 +356,12 @@ class AudioEngine:
             "-r", "48000",       # (alsa driver) sample rate
             "-p", "256",
             "-n", "3",
-            "--name", self._client_name,
         ]
+        # No --name: everything after `-d alsa` is parsed by the ALSA
+        # *driver*, which rejects unknown long options and exits 255 after
+        # printing its usage — confirmed by the captured stderr on real
+        # hardware. A server-level `-n <name>` would have to precede -d;
+        # the default server name is fine for us.
         # No scheduling flag on purpose: jackd2 defaults to RT mode (-r is
         # actually NO-realtime there). The appliance runs as root, so RT
         # grants succeed.
