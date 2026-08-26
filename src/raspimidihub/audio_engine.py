@@ -7,6 +7,7 @@ Connection Kit.
 
 import asyncio
 import logging
+import os
 import re
 import tempfile
 import time
@@ -371,11 +372,19 @@ class AudioEngine:
         log.info("Starting jackd: %s", " ".join(cmd))
         errf = tempfile.TemporaryFile()
         self._jack_errfile = errf
+        # Without a D-Bus session bus (our systemd service is headless) the
+        # default device-reservation handshake fails with "cannot be
+        # acquired" and jackd refuses the card outright. This env switch
+        # makes it take the device directly — right for an appliance that
+        # owns its sound cards.
+        spawn_env = dict(os.environ)
+        spawn_env["JACK_NO_AUDIO_RESERVATION"] = "1"
         try:
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=errf,
+                env=spawn_env,
                 start_new_session=True,
             )
         except FileNotFoundError:
