@@ -1157,3 +1157,9 @@ class AudioEngine:
         # Audio engine doesn't have the same event rate structure as MIDI
         # Return empty dict for compatibility
         return {}
+
+    def cc_dest_snapshot_dirty(self) -> Dict:
+        """Return CC destination snapshot dirty state (MidiEngine compatibility)."""
+        # Audio engine doesn't use CC destinations like MIDI
+        # Return empty dict for compatibility
+        return {}
