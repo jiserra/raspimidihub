@@ -1350,12 +1350,14 @@ class AudioEngine:
                     await self._rebuild_audio_graph()
                     continue
 
-                # Graph bring-up never succeeded (jackd could not bind, e.g.
-                # its ALSA device was busy) — retry periodically instead of
-                # dying forever. This also covers "the blocking process went
-                # away" recovery without needing a replug or mode switch.
+                # No graph at all (bring-up never succeeded, an unmanaged
+                # jackd died, ...) — retry periodically instead of dying
+                # forever. _jack_was_external may NOT gate this: hands-off
+                # means "don't fight a LIVE foreign server", and the probe
+                # below re-decides each cycle. If a foreign server still
+                # answers, _initialize_jack returns quietly after one
+                # jack_lsp; once none answers, WE take over.
                 if (self._jack_proc is None and not self._bridge_procs
-                        and not self._jack_was_external
                         and time.monotonic() >= self._next_graph_retry):
                     self._next_graph_retry = time.monotonic() + 30.0
                     log.info("JACK graph absent — retrying audio graph "
