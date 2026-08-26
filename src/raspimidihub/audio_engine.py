@@ -7,6 +7,7 @@ Connection Kit.
 
 import asyncio
 import logging
+import re
 import time
 from typing import Optional, Dict, List, Callable
 from dataclasses import dataclass
@@ -493,45 +494,44 @@ class AudioEngine:
 
             card_lines = cards_path.read_text().splitlines()
             for line in card_lines:
-                if not line.strip():
+                # Only bracketed header lines are card records:
+                #   " 3 [M8             ]: USB-Audio - M8"
+                # The continuation line below each header ("Dirtywave M8 at
+                # usb-0000:01:00.0-1.1, high speed") carries colons in its
+                # USB path and must NOT be parsed -- attempting it used to
+                # raise on int() and abort the whole scan, silently dropping
+                # every card that came after (e.g. a two-gadget rig).
+                m = re.match(r"\s*(\d+)\s+\[([^\]]*)\]\s*:", line)
+                if not m:
                     continue
 
-                # Parse line format: "0 [Headphones     ]: bcm2835 Headphones"
-                # Handle lines with multiple colons by splitting only on the first one
-                if ":" in line:
-                    # Split on the first colon to separate card number/name from description
-                    first_colon_idx = line.index(":")
-                    card_part = line[:first_colon_idx]
-                    description = line[first_colon_idx + 1:].strip()
+                card_num = int(m.group(1))
+                name = m.group(2).strip()
 
-                    # Extract card number from first part (e.g., "0 [Headphones     ]" -> 0)
-                    card_num = int(card_part.strip().split()[0])
+                # Built-in Pi audio (bcm2835 / vc4-hdmi) never joins the
+                # audio graph; USB gadgets only.
+                if not self._is_usb_card(card_num):
+                    continue
 
-                    # Extract card name from brackets
-                    if "[" in card_part and "]" in card_part:
-                        name = card_part.split("[")[1].split("]")[0].strip()
-                    else:
-                        name = card_part.strip().split()[0].strip()
+                # Check if device has capture (input) capability
+                has_capture = self._check_device_has_capture(card_num)
+                has_playback = self._check_device_has_playback(card_num)
 
-                    # Check if device has capture (input) capability
-                    has_capture = self._check_device_has_capture(card_num)
-                    has_playback = self._check_device_has_playback(card_num)
+                # Get more detailed device info
+                device_info = {
+                    "card": card_num,
+                    "name": name,
+                    "id": f"card{card_num}",
+                    "has_capture": has_capture,
+                    "has_playback": has_playback
+                }
 
-                    # Get more detailed device info
-                    device_info = {
-                        "card": card_num,
-                        "name": name,
-                        "id": f"card{card_num}",
-                        "has_capture": has_capture,
-                        "has_playback": has_playback
-                    }
+                # Extract USB topology if available
+                usb_info = self._extract_usb_device_info(card_num)
+                if usb_info:
+                    device_info.update(usb_info)
 
-                    # Extract USB topology if available
-                    usb_info = self._extract_usb_device_info(card_num)
-                    if usb_info:
-                        device_info.update(usb_info)
-
-                    devices.append(device_info)
+                devices.append(device_info)
 
         except Exception as e:
             log.warning("Failed to scan ALSA devices: %s", e)
