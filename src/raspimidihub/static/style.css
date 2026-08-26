@@ -3083,3 +3083,13 @@ body.spectator-mode * { scrollbar-width: none; }
     background: var(--accent); color: var(--bg, #fff);
 }
 .midi2-badge.forced { opacity: .45; text-decoration: line-through; }
+
+
+/* --- Audio routing page (shown on Routing tab in audio mode) --- */
+.aud-row {
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--border, rgba(255,255,255,.08));
+}
+.aud-row:last-child { border-bottom: none; }
+.aud-path { font-weight: 600; }
+.aud-caps { opacity: .6; font-size: .85em; text-align: right; }

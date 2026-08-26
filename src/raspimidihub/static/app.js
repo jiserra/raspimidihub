@@ -24,6 +24,7 @@ import { useRouter } from './ui/router.js';
 import { noteName } from './state/constants.js';
 import { DeviceDetailPanel } from './panels/devicedetail.js';
 import { RoutingPage } from './pages/routing.js';
+import { AudioRouting } from './pages/audio-routing.js';
 import { ControllerPage } from './pages/controller.js';
 import { PlayPage } from './pages/play.js';
 import { SettingsPage } from './pages/settings.js';
@@ -153,6 +154,7 @@ function App({ onSpectatorWatched, onRouteChange }) {
     const [connections, setConnections] = useState([]);
     const [toast, setToast] = useSharedUiState('toast', '');
     const [configFallback, setConfigFallback] = useState(false);
+    const [operatingMode, setOperatingMode] = useState('midi');
     const [version, setVersion] = useState('');
     const [apSsid, setApSsid] = useState('');
     // Server's current build token vs the one this JS bundle was loaded
@@ -247,6 +249,7 @@ function App({ onSpectatorWatched, onRouteChange }) {
     const loadSystemInfo = useCallback(() => {
         api('/system').then(s => {
             setConfigFallback(s.config_fallback);
+            setOperatingMode(s.operating_mode || 'midi');
             setVersion(s.version || '');
             setApSsid(s.ap_ssid || '');
             setServerBuild(s.build_token || '');
@@ -522,10 +525,16 @@ function App({ onSpectatorWatched, onRouteChange }) {
     let page;
     switch (tab) {
         case 'routing':
-            page = html`<${RoutingPage} devices=${devices} connections=${connections} refresh=${refresh} showToast=${showToast} clockSources=${clockSources} clockQuarters=${clockQuarters} midiRates=${midiRates}
-                onDeviceOpen=${(clientId) => setSelectedDeviceId(clientId)}
-                clipboard=${clipboard} setClipboard=${setClipboard}
-                showContextMenu=${showContextMenu} />`;
+            if (operatingMode === 'audio') {
+                // Modes are mutually exclusive: the MIDI matrix is not
+                // meaningful in audio mode — show audio routing instead.
+                page = html`<${AudioRouting} showToast=${showToast} />`;
+            } else {
+                page = html`<${RoutingPage} devices=${devices} connections=${connections} refresh=${refresh} showToast=${showToast} clockSources=${clockSources} clockQuarters=${clockQuarters} midiRates=${midiRates}
+                    onDeviceOpen=${(clientId) => setSelectedDeviceId(clientId)}
+                    clipboard=${clipboard} setClipboard=${setClipboard}
+                    showContextMenu=${showContextMenu} />`;
+            }
             break;
         case 'controller':
             page = html`<${ControllerPage} pluginDisplays=${pluginDisplays} showToast=${showToast}

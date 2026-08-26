@@ -258,7 +258,7 @@ class AudioEngine:
                 "jackd", "-d", "alsa",
                 "-d", target_device,  # Use the best available device
                 "-r", "48000",        # Sample rate
-                "-p", "128",          # Buffer size
+                "-p", "256",          # Larger buffer size for stability
                 "-n", "3",            # Periods
                 "--name", self._client_name
             ]
@@ -377,18 +377,21 @@ class AudioEngine:
                     continue
 
                 # Parse line format: "0 [Headphones     ]: bcm2835 Headphones"
-                parts = line.split(":")
-                if len(parts) >= 2:
+                # Handle lines with multiple colons by splitting only on the first one
+                if ":" in line:
+                    # Split on the first colon to separate card number/name from description
+                    first_colon_idx = line.index(":")
+                    card_part = line[:first_colon_idx]
+                    description = line[first_colon_idx + 1:].strip()
+
                     # Extract card number from first part (e.g., "0 [Headphones     ]" -> 0)
-                    first_part = parts[0].strip()
-                    card_num = int(first_part.split()[0])
-                    name_part = parts[1].strip()
+                    card_num = int(card_part.strip().split()[0])
 
                     # Extract card name from brackets
-                    if "[" in name_part and "]" in name_part:
-                        name = name_part.split("[")[1].split("]")[0].strip()
+                    if "[" in card_part and "]" in card_part:
+                        name = card_part.split("[")[1].split("]")[0].strip()
                     else:
-                        name = name_part.split()[0].strip()
+                        name = card_part.strip().split()[0].strip()
 
                     # Check if device has capture (input) capability
                     has_capture = self._check_device_has_capture(card_num)

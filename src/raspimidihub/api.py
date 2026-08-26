@@ -3053,7 +3053,9 @@ def register_api(server: WebServer, engine, config: Config,
         try:
             success = await current_engine.connect_devices(source_device, dest_device, channel_mapping)
             if success:
-                config.set_audio_connections(current_engine.connections)
+                # Serialize via the engine (dataclasses → plain dicts) —
+                # raw AudioConnection objects aren't JSON-serializable.
+                current_engine._save_audio_routing_config(config.data)
                 await config.asave()
                 current_engine.mark_dirty()
                 return Response.json({"status": "created"}, 201)
@@ -3094,7 +3096,7 @@ def register_api(server: WebServer, engine, config: Config,
 
             success = await current_engine.remove_connection(source_device, dest_device)
             if success:
-                config.set_audio_connections(current_engine.connections)
+                current_engine._save_audio_routing_config(config.data)
                 await config.asave()
                 current_engine.mark_dirty()
                 return Response.json({"status": "deleted"})
