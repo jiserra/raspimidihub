@@ -94,10 +94,30 @@ async def async_main() -> None:
         initializer=cpu_affinity.move_to_housekeeping))
 
     led = LedController()
-    engine = MidiEngine()
     config = Config()
     wifi = WifiManager()
     plugin_host = PluginHost()
+
+    # Engine factory function for creating the appropriate engine
+    def create_engine(mode: str, **kwargs) -> object:
+        """Create the appropriate engine based on mode."""
+        if mode == "audio":
+            log.info("Creating AudioEngine")
+            from .audio_engine import AudioEngine
+            return AudioEngine()
+        else:  # midi mode (default)
+            log.info("Creating MidiEngine")
+            return MidiEngine()
+
+    # Initialize engine manager with the default mode
+    from .engine_manager import EngineManager
+
+    operating_mode = config.operating_mode
+    log.info("Operating mode: %s", operating_mode.upper())
+
+    engine_manager = EngineManager()
+    await engine_manager.switch_mode(operating_mode, create_engine)
+    engine = engine_manager.get_engine()
 
     # Load config
     config.init_runtime_copy()
@@ -115,27 +135,45 @@ async def async_main() -> None:
     # at boot on some Pi-OS variants), spin up the BlueZ wrapper +
     # BLE-MIDI bridge. Both are no-ops if the host has no BT
     # hardware / dbus-next isn't installed.
-    from .ble_midi_bridge import BleMidiBridge
-    from .bluetooth import BluetoothMidi
+    # Make this optional to prevent crashes if dependencies aren't available
+    bt = None
+    ble_bridge = None
     try:
-        subprocess.run(["rfkill", "unblock", "bluetooth"],
-                       capture_output=True, timeout=5)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    bt = BluetoothMidi()
-    ble_bridge = BleMidiBridge()
-    bt.ble_bridge = ble_bridge
-    engine._ble_bridge = ble_bridge  # so device scans see BLE clients
+        from .ble_midi_bridge import BleMidiBridge
+        from .bluetooth import BluetoothMidi
+        try:
+            subprocess.run(["rfkill", "unblock", "bluetooth"],
+                           capture_output=True, timeout=5)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        # Only initialize if engine is available
+        if engine is not None:
+            bt = BluetoothMidi()
+            ble_bridge = BleMidiBridge()
+            bt.ble_bridge = ble_bridge
+            if hasattr(engine, '_ble_bridge'):
+                engine._ble_bridge = ble_bridge  # so device scans see BLE clients
+    except ImportError as e:
+        log.warning("Bluetooth MIDI not available: %s", e)
 
     # Network MIDI: exported devices become RTP-MIDI sessions, peer
     # hubs' exports get mirrored into the matrix. No-op (available:
     # false) when python3-zeroconf isn't installed.
-    from .network_midi import NetworkMidiManager
-    network_midi = NetworkMidiManager(engine, config, server)
-    engine._network_midi = network_midi  # device scans see mirror clients
+    # Make this optional to prevent crashes
+    network_midi = None
+    try:
+        from .network_midi import NetworkMidiManager
+        if engine is not None:
+            network_midi = NetworkMidiManager(engine, config, server)
+            if hasattr(engine, '_network_midi'):
+                engine._network_midi = network_midi  # device scans see mirror clients
+    except ImportError as e:
+        log.warning("Network MIDI not available: %s", e)
 
     # Register API routes
-    register_api(server, engine, config, wifi, bt, network_midi)
+    if engine is not None:
+        register_api(server, engine, config, wifi, bt, network_midi, engine_manager=engine_manager)
 
     # Spectator-mode mirroring service. Owns its own routes, per-conn
     # state map, and watcher tracking; plugs into the WebServer via
@@ -421,12 +459,14 @@ async def async_main() -> None:
         # (WIDI powered up after boot) is handled by the explicit
         # Connect button in the Add Device → Bluetooth panel — no
         # background polling.
-        asyncio.ensure_future(bt.restore_connected_bridges())
+        if bt is not None:
+            asyncio.ensure_future(bt.restore_connected_bridges())
 
         # Bring up network MIDI (if enabled in config): exports restore
         # for online devices, discovery browser starts. After the
         # initial scan so exported devices resolve to ALSA clients.
-        asyncio.ensure_future(network_midi.start())
+        if network_midi is not None:
+            asyncio.ensure_future(network_midi.start())
 
         notify_systemd("READY=1")
         log.info("Service ready (web on port %d)", port)
@@ -463,7 +503,9 @@ async def async_main() -> None:
         asyncio.ensure_future(sse_heartbeat(server))
 
         try:
-            await engine.run_event_loop()
+            # Always get the current engine from the manager (supports dynamic mode switching)
+            current_engine = engine_manager.get_engine()
+            await current_engine.run_event_loop()
         except asyncio.CancelledError:
             # Consume the cancellation here so the cleanup awaits below
             # don't immediately re-raise CancelledError. The task is still
@@ -484,10 +526,11 @@ async def async_main() -> None:
             log.warning("Web server stop timed out")
         # BY to all RTP-MIDI participants + mDNS goodbye, so peers
         # drop the sessions instead of timing them out.
-        try:
-            await asyncio.wait_for(network_midi.stop(), timeout=2.0)
-        except (Exception, asyncio.CancelledError):
-            log.warning("Network MIDI stop failed", exc_info=True)
+        if network_midi is not None:
+            try:
+                await asyncio.wait_for(network_midi.stop(), timeout=2.0)
+            except (Exception, asyncio.CancelledError):
+                log.warning("Network MIDI stop failed", exc_info=True)
         # Flush a final autosave BEFORE tearing down plugins, so a clean
         # stop (deploy / reboot) resumes the exact in-memory state and the
         # snapshot still sees live plugin instances. Power cuts skip this
@@ -500,7 +543,7 @@ async def async_main() -> None:
         except Exception:
             log.warning("Final autosave flush failed", exc_info=True)
         plugin_host.stop_all()
-        engine.stop()
+        await engine_manager.shutdown()
         led.set_off()
         led.restore_default_trigger()
         log.info("Shutdown complete")

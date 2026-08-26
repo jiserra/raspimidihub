@@ -971,6 +971,122 @@ function SettingsSysInfo({ showToast, isUpgrading }) {
     `;
 }
 
+function SettingsMode({ showToast }) {
+    const [operatingMode, setOperatingMode] = useState('midi');
+    const [modeLocked, setModeLocked] = useState(false);
+    const [applying, setApplying] = useState(false);
+    const [showConfirm, setShowConfirm] = useState(false);
+    const [pendingMode, setPendingMode] = useState(null);
+
+    useEffect(() => {
+        api('/system').then(s => {
+            setOperatingMode(s.operating_mode || 'midi');
+            setModeLocked(s.mode_locked || false);
+        }).catch(() => {});
+    }, []);
+
+    const toggleModeLock = async () => {
+        const newState = !modeLocked;
+        setModeLocked(newState);
+        await api('/system', { method: 'PATCH', body: JSON.stringify({ mode_locked: newState }) });
+        showToast(newState ? 'Mode locked' : 'Mode unlocked');
+    };
+
+    const requestModeChange = (newMode) => {
+        if (modeLocked) {
+            showToast('Mode is locked - unlock first');
+            return;
+        }
+        if (newMode === operatingMode) return;
+        setPendingMode(newMode);
+        setShowConfirm(true);
+    };
+
+    const confirmModeChange = async () => {
+        if (!pendingMode) return;
+        setApplying(true);
+        setShowConfirm(false);
+        try {
+            const res = await api('/system', { method: 'PATCH', body: JSON.stringify({ operating_mode: pendingMode }) });
+            if (res.status === 'mode_switched') {
+                setOperatingMode(pendingMode);
+                showToast(`Switched to ${pendingMode} mode`);
+                setPendingMode(null);
+            } else if (res.status === 'saved_restart_required') {
+                showToast(`Mode saved. Restart required.`);
+            } else {
+                showToast(`Mode change completed`);
+            }
+        } catch (e) {
+            showToast('Failed to change mode');
+        } finally {
+            setApplying(false);
+        }
+    };
+
+    return html`
+        <div class="card">
+            <h3>Operating Mode</h3>
+            <p style="font-size:13px;color:var(--text-dim);margin-bottom:12px">
+                Select whether RaspiMIDIHub routes MIDI or Audio. You can switch between modes dynamically.
+            </p>
+
+            <div style="display:flex;gap:12px;align-items:flex-start;margin-bottom:16px">
+                <button class="mode-radio ${operatingMode === 'midi' ? 'active' : ''}"
+                    onclick=${() => requestModeChange('midi')}
+                    disabled=${applying || modeLocked}
+                    style="flex:1;padding:16px;text-align:left;border:2px solid ${operatingMode === 'midi' ? 'var(--primary)' : 'var(--border)'};border-radius:8px;background:${operatingMode === 'midi' ? 'var(--primary-faint)' : 'var(--surface)'};cursor:${applying || modeLocked ? 'not-allowed' : 'pointer'};transition:all 200ms">
+                    <div style="font-weight:600;margin-bottom:4px">MIDI Routing</div>
+                    <div style="font-size:12px;color:var(--text-dim)">Route MIDI between USB devices, network, and plugins</div>
+                </button>
+
+                <button class="mode-radio ${operatingMode === 'audio' ? 'active' : ''}"
+                    onclick=${() => requestModeChange('audio')}
+                    disabled=${applying || modeLocked}
+                    style="flex:1;padding:16px;text-align:left;border:2px solid ${operatingMode === 'audio' ? 'var(--primary)' : 'var(--border)'};border-radius:8px;background:${operatingMode === 'audio' ? 'var(--primary-faint)' : 'var(--surface)'};cursor:${applying || modeLocked ? 'not-allowed' : 'pointer'};transition:all 200ms">
+                    <div style="font-weight:600;margin-bottom:4px">Audio Routing</div>
+                    <div style="font-size:12px;color:var(--text-dim)">Route audio between USB interfaces (via JACK)</div>
+                </button>
+            </div>
+
+            <label class="msg-toggle" style="margin-top:8px">
+                <input type="checkbox" checked=${modeLocked} onchange=${toggleModeLock} />
+                <span>Lock mode (prevent accidental changes)</span>
+            </label>
+
+            ${showConfirm && html`
+                <div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:1000">
+                    <div class="card" style="max-width:400px;padding:24px">
+                        <h3>Confirm Mode Change</h3>
+                        <p style="margin:16px 0">
+                            Switch from ${operatingMode} to ${pendingMode} mode?
+                            The current engine will be stopped and the new mode engine will be started.
+                        </p>
+                        <div style="display:flex;gap:8px;justify-content:flex-end">
+                            <button class="btn" onclick=${() => setShowConfirm(false)}>Cancel</button>
+                            <button class="btn btn-primary" onclick=${confirmModeChange}>
+                                ${applying ? 'Switching...' : 'Switch Mode'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `}
+        </div>
+
+        <div class="card">
+            <h3>Current Mode Status</h3>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+                <span style="width:12px;height:12px;border-radius:50%;background:${operatingMode === 'midi' ? 'var(--success)' : 'var(--text-dim)'}"></span>
+                <span>MIDI Routing: ${operatingMode === 'midi' ? 'Active' : 'Inactive'}</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+                <span style="width:12px;height:12px;border-radius:50%;background:${operatingMode === 'audio' ? 'var(--success)' : 'var(--text-dim)'}"></span>
+                <span>Audio Routing: ${operatingMode === 'audio' ? 'Active' : 'Inactive'}</span>
+            </div>
+        </div>
+    `;
+}
+
 function SettingsNetwork({ showToast }) {
     const [ifaces, setIfaces] = useState([]);
     const reload = useCallback(() => { api('/network').then(setIfaces).catch(() => {}); }, []);
@@ -1559,6 +1675,7 @@ function SettingsNetworkMidi({ showToast }) {
 
 const SECTIONS = [
     { key: 'sys-info',    title: 'Sys Info',                hint: 'Hostname, CPU, RAM, latency, Reload, Reboot' },
+    { key: 'mode',        title: 'Operating Mode',          hint: 'Switch between MIDI and Audio routing (requires restart)' },
     { key: 'network',     title: 'Network',                 hint: 'WiFi mode, AP password, USB tether, Ethernet' },
     { key: 'midi',        title: 'MIDI',                    hint: 'Default routing for new devices' },
     { key: 'display',     title: 'Display',                 hint: 'MIDI activity bar, sounds, scroll-assist, density' },
@@ -1579,6 +1696,7 @@ export function SettingsPage({ showToast, showMidiBar, toggleMidiBar,
         let body;
         switch (section) {
             case 'sys-info':    body = html`<${SettingsSysInfo} showToast=${showToast} isUpgrading=${isUpgrading} />`; break;
+            case 'mode':        body = html`<${SettingsMode} showToast=${showToast} />`; break;
             case 'network':     body = html`<${SettingsNetwork} showToast=${showToast} />`; break;
             case 'midi':        body = html`<${SettingsMidi} showToast=${showToast} />`; break;
             case 'display':     body = html`<${SettingsDisplay} showMidiBar=${showMidiBar} toggleMidiBar=${toggleMidiBar} />`; break;

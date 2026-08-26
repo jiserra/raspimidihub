@@ -333,19 +333,25 @@ _CAPTIVE_PASSTHROUGH = {
 }
 
 
-def register_api(server: WebServer, engine: MidiEngine, config: Config,
+def register_api(server: WebServer, engine, config: Config,
                   wifi: WifiManager | None = None,
                   bluetooth: BluetoothMidi | None = None,
-                  network_midi=None):
+                  network_midi=None,
+                  engine_manager=None):
     """Register all API routes on the web server."""
+
+    # Store engine manager reference for mode switching
+    if engine_manager:
+        server._engine_manager = engine_manager
 
     # Wire the dirty-tracker SSE side so mark_dirty / clear_dirty can fan
     # out a config-dirty event from any thread (CC-driven param mutations
     # come from worker threads). The plugin_host._on_dirty_cb hook is
     # wired in __main__ AFTER engine._plugin_host is attached — register_api
     # runs before that, so doing it here would no-op.
-    engine._dirty_loop = asyncio.get_event_loop()
-    engine._dirty_sse_cb = server.send_sse
+    if hasattr(engine, '_dirty_loop'):
+        engine._dirty_loop = asyncio.get_event_loop()
+        engine._dirty_sse_cb = server.send_sse
 
     # Serialize the live engine state into config.data. Shared by manual
     # Save, the autosaver, and the shutdown flush so all three persist an
@@ -590,6 +596,8 @@ def register_api(server: WebServer, engine: MidiEngine, config: Config,
             "sse_queue_depths": sse_queue_depths,
             "latency_max": latency_max,
             "config_fallback": config.fallback_active,
+            "operating_mode": config.operating_mode,
+            "mode_locked": config.mode_locked,
             "default_routing": config.default_routing,
             "config_dirty": engine.config_dirty,
             "midi2": {"alsa_lib": _ump.alsa_lib, "kernel": _ump.kernel,
@@ -600,15 +608,72 @@ def register_api(server: WebServer, engine: MidiEngine, config: Config,
     # PATCH /api/system — update system settings
     # ================================================================
 
-    @server.route("PATCH", "/api/system", summary="Update system settings (currently default_routing: all or none).")
+    @server.route("PATCH", "/api/system", summary="Update system settings (operating_mode, mode_locked, default_routing: all or none).")
     async def api_patch_system(req: Request) -> Response:
         data = req.json
+
+        # Handle operating_mode change
+        if "operating_mode" in data:
+            val = data["operating_mode"]
+            if val not in ("midi", "audio"):
+                return Response.error("operating_mode must be 'midi' or 'audio'")
+            if config.mode_locked:
+                return Response.error("Mode is locked - unlock first")
+            if config.operating_mode == val:
+                return Response.json({"status": "unchanged"})  # No change needed
+
+            # Trigger dynamic mode switch via the engine manager
+            engine_manager = getattr(server, '_engine_manager', None)
+            if engine_manager:
+                try:
+                    # Get the engine factory from the main module
+                    import sys
+                    main_module = sys.modules.get('raspimidihub.__main__')
+                    if not main_module:
+                        main_module = sys.modules.get('__main__')
+                    engine_factory = getattr(main_module, 'create_engine', None)
+
+                    if engine_factory:
+                        await engine_manager.switch_mode(val, engine_factory)
+
+                        # Update config
+                        config.data["operating_mode"] = val
+                        await config.asave()
+
+                        # Update the global engine reference in the main module
+                        if hasattr(main_module, 'engine'):
+                            main_module.engine = engine_manager.get_engine()
+
+                        # Also update the local engine reference
+                        globals()['engine'] = engine_manager.get_engine()
+
+                        return Response.json({"status": "mode_switched", "new_mode": val})
+                    else:
+                        return Response.error("Engine factory not available")
+                except Exception as e:
+                    return Response.error(f"Failed to switch mode: {str(e)}")
+            else:
+                # Fallback if no engine manager (shouldn't happen)
+                config.data["operating_mode"] = val
+                await config.asave()
+                return Response.json({"status": "saved_restart_required"})
+
+        # Handle mode_locked change
+        if "mode_locked" in data:
+            val = data["mode_locked"]
+            if not isinstance(val, bool):
+                return Response.error("mode_locked must be true or false")
+            config.data["mode_locked"] = val
+            await config.asave()
+
+        # Handle default_routing change (legacy MIDI mode)
         if "default_routing" in data:
             val = data["default_routing"]
             if val not in ("all", "none"):
                 return Response.error("default_routing must be 'all' or 'none'")
             config.data["default_routing"] = val
             await config.asave()
+
         return Response.json({"status": "updated"})
 
     # ================================================================

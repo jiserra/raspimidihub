@@ -156,6 +156,10 @@ def summarize_config_diff(old: dict, new: dict) -> str:
 
 DEFAULT_CONFIG = {
     "version": 1,
+    # Operating mode: "midi" or "audio" - mutually exclusive routing modes
+    "operating_mode": "midi",
+    "mode_locked": False,  # Prevent accidental mode switching
+    # MIDI routing mode (legacy, only used when operating_mode == "midi")
     "mode": "all-to-all",
     # New device pairs arrive DISCONNECTED by default; the user wires up
     # what they want. "all" restores the auto-connect-everything behaviour
@@ -220,6 +224,16 @@ DEFAULT_CONFIG = {
         # IPs/hostnames to invite directly when mDNS can't reach them.
         "manual_peers": [],
     },
+    "audio_routing": {
+        # Audio routing configuration (only used when operating_mode == "audio")
+        "connections": [],  # Active audio connections
+        "devices": {},  # Audio device registry by stable_id
+        "global_settings": {
+            "sample_rate": 48000,  # Default sample rate
+            "buffer_size": 128,  # JACK buffer size
+            "gain_processor_type": "jack_native"  # Gain control method
+        }
+    },
 }
 
 
@@ -263,12 +277,28 @@ class Config:
         return self._fallback_active
 
     @property
+    def operating_mode(self) -> str:
+        """Operating mode: 'midi' or 'audio'"""
+        return self._data.get("operating_mode", "midi")
+
+    @property
+    def mode_locked(self) -> bool:
+        """Prevent accidental mode switching"""
+        return self._data.get("mode_locked", False)
+
+    @property
     def mode(self) -> str:
+        # Legacy MIDI routing mode (only used when operating_mode == "midi")
         return self._data.get("mode", "all-to-all")
 
     @property
     def default_routing(self) -> str:
         return self._data.get("default_routing", "none")
+
+    @property
+    def audio_routing(self) -> dict:
+        """Audio routing configuration (only used when operating_mode == "audio")"""
+        return self._data.get("audio_routing", {"connections": [], "devices": {}, "global_settings": {}})
 
     @property
     def connections(self) -> list:
@@ -714,7 +744,30 @@ class Config:
             log.info("Copied config to runtime: %s", RUNTIME_CONFIG)
 
     def set_mode(self, mode: str):
+        """Set legacy MIDI routing mode (only used when operating_mode == "midi")"""
         self._data["mode"] = mode
+
+    def set_operating_mode(self, mode: str):
+        """Set operating mode: 'midi' or 'audio'"""
+        if mode not in ("midi", "audio"):
+            raise ValueError("Operating mode must be 'midi' or 'audio'")
+        self._data["operating_mode"] = mode
+
+    def set_mode_locked(self, locked: bool):
+        """Prevent accidental mode switching"""
+        self._data["mode_locked"] = locked
 
     def set_connections(self, connections: list):
         self._data["connections"] = connections
+
+    def set_audio_connections(self, connections: list):
+        """Set audio routing connections (only used when operating_mode == "audio")"""
+        if "audio_routing" not in self._data:
+            self._data["audio_routing"] = {}
+        self._data["audio_routing"]["connections"] = connections
+
+    def set_audio_devices(self, devices: dict):
+        """Set audio device registry (only used when operating_mode == "audio")"""
+        if "audio_routing" not in self._data:
+            self._data["audio_routing"] = {}
+        self._data["audio_routing"]["devices"] = devices
