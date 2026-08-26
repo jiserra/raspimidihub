@@ -273,13 +273,17 @@ class AudioEngine:
                 # Process has exited
                 stderr = process.stderr.read().decode() if process.stderr else ""
                 log.error("JACK daemon failed to start: %s", stderr)
-                raise RuntimeError("JACK daemon startup failed")
+                # Don't raise an error - continue without JACK
+                log.warning("Continuing without JACK server - audio routing will use command-line tools")
+                return
 
             log.info("JACK server started successfully (PID: %d)", process.pid)
 
+        except FileNotFoundError:
+            log.warning("jackd not found - audio routing will use command-line tools")
         except Exception as e:
-            log.error("Failed to start JACK server: %s", e)
-            raise
+            log.warning("Failed to start JACK server: %s", e)
+            log.warning("Continuing without JACK server - audio routing will use command-line tools")
 
     def _find_best_audio_device(self) -> Optional[str]:
         """Find the best audio device for JACK to use.
@@ -348,6 +352,8 @@ class AudioEngine:
 
         except Exception as e:
             log.error("Audio device discovery failed: %s", e)
+
+    def _scan_alsa_devices(self):
         """Scan for ALSA audio devices from /proc/asound."""
         devices = []
         try:
