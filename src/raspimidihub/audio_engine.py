@@ -144,6 +144,7 @@ class AudioEngine:
         self._card_of_device: Dict[str, int] = {}        # device_id -> ALSA card num
         self._jack_was_external = False                  # True if jackd was already running at start
         self._owner_card: Optional[int] = None           # card our own jackd binds (None otherwise)
+        self._jack_probe_misses = 0                      # consecutive jack_lsp probes that failed while our jackd lives
 
     @property
     def devices(self) -> List[AudioDevice]:
@@ -1341,10 +1342,33 @@ class AudioEngine:
                 # graph and re-wire saved connections. (_jack_proc is only
                 # set when we spawned jackd ourselves; an external daemon
                 # is nobody's business here.)
-                if self._jack_proc is not None and self._jack_proc.poll() is not None:
-                    log.warning("Our jackd exited (rc=%s)", self._jack_proc.returncode)
-                    await self._rebuild_audio_graph()
-                    continue
+                if self._jack_proc is not None:
+                    if self._jack_proc.poll() is not None:
+                        log.warning("Our jackd exited (rc=%s)",
+                                    self._jack_proc.returncode)
+                        await self._rebuild_audio_graph()
+                        continue
+                    # poll() can't see a WEDGED daemon. Observed failure
+                    # mode: its ALSA card yanked mid-stream → the process
+                    # survives, the RT thread hangs, and no new client —
+                    # not even a probe — can ever attach again. Probe the
+                    # control plane; 3 consecutive misses (~6 s) ⇒ declare
+                    # it dead, kill it, rebuild.
+                    if not self._server_reachable(timeout=1.0):
+                        self._jack_probe_misses += 1
+                        if self._jack_probe_misses >= 3:
+                            log.warning(
+                                "Our jackd is unresponsive %d probes in a "
+                                "row (PID %s) — killing and rebuilding",
+                                self._jack_probe_misses, self._jack_proc.pid)
+                            try:
+                                self._jack_proc.kill()
+                            except Exception:
+                                pass
+                            await self._rebuild_audio_graph()
+                            continue
+                    else:
+                        self._jack_probe_misses = 0
                 if any(p.poll() is not None for p in self._bridge_procs.values()):
                     log.warning("A JACK bridge died — rebuilding audio graph")
                     await self._rebuild_audio_graph()
@@ -1413,9 +1437,30 @@ class AudioEngine:
                 pass
         self._bridge_errfiles.clear()
         self._bridge_procs.clear()
-        if self._jack_errfile is not None and self._jack_proc is not None \
-                and self._jack_proc.poll() is not None:
-            log.warning("Old jackd rc=%s%s", self._jack_proc.returncode,
+        # A rebuild can be triggered while the old daemon is still alive —
+        # a wedged one ignores nothing about being SIGTERMed, but a merely
+        # hung one does, hence TERM → wait → KILL before any new jackd
+        # could race it for the same ALSA card / shm registry.
+        old_proc = self._jack_proc
+        self._jack_proc = None
+        if old_proc is not None and old_proc.poll() is None:
+            log.warning("Terminating unresponsive jackd (PID %s)", old_proc.pid)
+
+            def _reap() -> None:
+                try:
+                    old_proc.terminate()
+                    old_proc.wait(timeout=4)
+                except Exception:
+                    try:
+                        old_proc.kill()
+                        old_proc.wait(timeout=2)
+                    except Exception:
+                        pass
+
+            await asyncio.to_thread(_reap)
+        if self._jack_errfile is not None and old_proc is not None \
+                and old_proc.poll() is not None:
+            log.warning("Old jackd rc=%s%s", old_proc.returncode,
                         self._read_err_tail(self._jack_errfile))
         if self._jack_errfile is not None:
             try:
@@ -1423,7 +1468,6 @@ class AudioEngine:
             except Exception:
                 pass
             self._jack_errfile = None
-        self._jack_proc = None
         self._owner_card = None
         try:
             await asyncio.sleep(1.0)   # let the kernel settle the USB removal
