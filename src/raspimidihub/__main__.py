@@ -110,7 +110,11 @@ async def async_main() -> None:
     wifi = WifiManager()
     plugin_host = PluginHost()
 
-    # Initialize engine manager with the default mode
+    # Load config FIRST, before engine initialization
+    config.init_runtime_copy()
+    config_ok = config.load()
+
+    # Initialize engine manager with the loaded mode
     from .engine_manager import EngineManager
 
     operating_mode = config.operating_mode
@@ -119,10 +123,6 @@ async def async_main() -> None:
     engine_manager = EngineManager()
     await engine_manager.switch_mode(operating_mode, create_engine)
     engine = engine_manager.get_engine()
-
-    # Load config
-    config.init_runtime_copy()
-    config_ok = config.load()
 
     # Determine web server port (80 requires root, fallback to 8080).
     # RASPIMIDIHUB_PORT overrides both — handy off-appliance where 8080 may
