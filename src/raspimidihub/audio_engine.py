@@ -367,10 +367,12 @@ class AudioEngine:
                 if not line.strip():
                     continue
 
-                # Parse line format: "0 [MIDI    ]: USB-MIDI"
+                # Parse line format: "0 [Headphones     ]: bcm2835 Headphones"
                 parts = line.split(":")
                 if len(parts) >= 2:
-                    card_num = int(parts[0].strip())
+                    # Extract card number from first part (e.g., "0 [Headphones     ]" -> 0)
+                    first_part = parts[0].strip()
+                    card_num = int(first_part.split()[0])
                     name_part = parts[1].strip()
 
                     # Extract card name from brackets
