@@ -90,7 +90,7 @@ class AudioEngine:
         self._change_seq = 0
 
         # Config dirty tracking (parallel to MidiEngine.config_dirty)
-        self.config_dirty = False
+        self._dirty = False
 
         # Audio routing settings
         self._sample_rate = 48000
